@@ -75,6 +75,8 @@ from verl.utils.ulysses import (
 )
 from verl.workers.config.optimizer import build_optimizer
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
+import torch.nn.functional as F
+
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
@@ -833,9 +835,739 @@ def run_sft(config):
     destroy_global_process_group()
 
 
+class AntiForgettingSFTTrainer(FSDPSFTTrainer):
+    """
+    Extended FSDP SFT Trainer with anti-forgetting capability.
+    
+    Key differences from base trainer:
+    - Maintains a frozen reference model (p0)
+    - Iterates through outer loops of: SFT → soft label construction → soft label training
+    - Uses geometric averaging of p0 and q distributions for soft labels
+    """
+    
+    def __init__(self, config, device_mesh, ulysses_device_mesh, tokenizer, train_dataset, val_dataset):
+        # Anti-forgetting specific config (set before super().__init__)
+        self.n_outer_iterations = getattr(config.trainer, 'n_outer_iterations', 3)
+        self.soft_label_alpha = getattr(config.trainer, 'soft_label_alpha', 0.5)
+        self.use_dynamic_alpha = getattr(config.trainer, 'use_dynamic_alpha', False)
+        self.soft_label_sample_ratio = getattr(config.trainer, 'soft_label_sample_ratio', 0.8)
+        
+        # We need to save the initial state before any training
+        self.save_reference_state = True
+        
+        super().__init__(config, device_mesh, ulysses_device_mesh, tokenizer, train_dataset, val_dataset)
+        
+        # After parent init, save the initial model state as p0
+        self._save_initial_reference_state()
+        
+        if self.device_mesh.get_rank() == 0:
+            print(f"Anti-Forgetting SFT Configuration:")
+            print(f"  - Outer iterations: {self.n_outer_iterations}")
+            print(f"  - Soft label alpha: {self.soft_label_alpha}")
+            print(f"  - Use dynamic alpha: {self.use_dynamic_alpha}")
+            print(f"  - Gold/Generated sample ratio: {self.soft_label_sample_ratio:.2f}")
+    
+    def _save_initial_reference_state(self):
+        """
+        Save the initial model state as reference (p0).
+        We store it as a state_dict that can be loaded later for computing logits.
+        """
+        if self.device_mesh.get_rank() == 0:
+            print("Saving initial model state as reference (p0)...")
+        
+        # Check if using FSDP1 or FSDP2
+        if self.config.model.strategy == "fsdp":
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+            
+            # Save full state dict on rank 0
+            save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, save_policy):
+                self.p0_state_dict = self.fsdp_model.state_dict()
+            
+            # On other ranks, set to None (will be broadcasted when needed)
+            if self.device_mesh.get_rank() != 0:
+                self.p0_state_dict = None
+                
+        elif self.config.model.strategy == "fsdp2":
+            # For FSDP2, use the built-in state_dict methods
+            if self.device_mesh.get_rank() == 0:
+                self.p0_state_dict = self.fsdp_model.state_dict()
+            else:
+                self.p0_state_dict = None
+        else:
+            raise NotImplementedError(f"Strategy {self.config.model.strategy} not implemented")
+        
+        if self.device_mesh.get_rank() == 0:
+            print("Initial reference state (p0) saved successfully.")
+    
+    def _load_reference_model_for_inference(self, target_model):
+        """
+        Load p0 state into a model for inference.
+        This is called when we need to compute logits from p0.
+        
+        Args:
+            target_model: The FSDP model to load p0 state into
+        """
+        if self.config.model.strategy == "fsdp":
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+            
+            load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(target_model, StateDictType.FULL_STATE_DICT, load_policy):
+                if self.device_mesh.get_rank() == 0:
+                    target_model.load_state_dict(self.p0_state_dict)
+        elif self.config.model.strategy == "fsdp2":
+            # For FSDP2
+            if self.device_mesh.get_rank() == 0:
+                target_model.load_state_dict(self.p0_state_dict)
+        else:
+            raise NotImplementedError(f"Strategy {self.config.model.strategy} not implemented")
+        
+        # Sync across all ranks
+        torch.distributed.barrier()
+        target_model.eval()
+    
+    def _init_reference_model(self):
+        """This method is replaced by _save_initial_reference_state"""
+        pass
+    
+    def _create_temp_sft_model(self):
+        """
+        Create a temporary model q for SFT exploration.
+        
+        For FSDP models, we need to:
+        1. Save current model state
+        2. Create a new model instance with the same architecture
+        3. Load the saved state into the new model
+        4. Wrap it with FSDP
+        """
+        if self.device_mesh.get_rank() == 0:
+            print("Creating temporary SFT model (q) from current policy (p)...")
+        
+        from verl.utils.fsdp_utils import get_fsdp_wrap_policy
+        from torch.distributed.fsdp import CPUOffload, MixedPrecision, ShardingStrategy
+        from verl.utils.device import get_device_id
+        
+        # Step 1: Get state dict from current model
+        if self.config.model.strategy == "fsdp":
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+            
+            save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, save_policy):
+                state_dict = self.fsdp_model.state_dict()
+        elif self.config.model.strategy == "fsdp2":
+            if self.device_mesh.get_rank() == 0:
+                state_dict = self.fsdp_model.state_dict()
+            else:
+                state_dict = None
+        else:
+            raise NotImplementedError(f"Strategy {self.config.model.strategy} not implemented")
+        
+        # Step 2: Create a new model instance with same architecture
+        torch_dtype = self.config.model.fsdp_config.get("model_dtype", "fp32")
+        from verl.utils.torch_dtypes import PrecisionType
+        torch_dtype = PrecisionType.to_dtype(torch_dtype)
+        
+        # Get initialization context
+        from verl.utils.fsdp_utils import get_init_weight_context_manager
+        init_context = get_init_weight_context_manager(
+            use_meta_tensor=not self.model_config.tie_word_embeddings, 
+            mesh=self.device_mesh
+        )
+        
+        from transformers import AutoModelForCausalLM
+        
+        with init_context():
+            temp_model = AutoModelForCausalLM.from_config(
+                self.model_config,
+                torch_dtype=torch_dtype,
+                attn_implementation="flash_attention_2",
+            )
+            
+            # Apply same modifications as original model
+            if self.use_remove_padding or self.config.ulysses_sequence_parallel_size > 1:
+                from verl.models.transformers.monkey_patch import apply_monkey_patch
+                apply_monkey_patch(model=temp_model, ulysses_sp_size=self.config.ulysses_sequence_parallel_size)
+            
+            if self.config.model.get("use_liger", False):
+                from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
+                _apply_liger_kernel_to_instance(model=temp_model)
+            
+            if self.lora:
+                temp_model.enable_input_require_grads()
+                # Note: LoRA setup would need special handling
+                # For now, assuming we're working with full model
+        
+        if self.config.model.enable_gradient_checkpointing:
+            temp_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        
+        # Step 3: Wrap with FSDP
+        mixed_precision = MixedPrecision(
+            param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.float32
+        )
+        
+        auto_wrap_policy = get_fsdp_wrap_policy(
+            temp_model,
+            config=self.config.model.fsdp_config.wrap_policy,
+            is_lora=self.lora,
+        )
+        
+        cpu_offload = None
+        if self.config.model.fsdp_config.cpu_offload:
+            cpu_offload = CPUOffload(offload_params=self.config.model.fsdp_config.offload_params)
+        
+        fsdp_strategy = self.config.model.strategy
+        if fsdp_strategy == "fsdp":
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+            from verl.utils.fsdp_utils import init_fn
+            
+            temp_fsdp_model = FSDP(
+                temp_model,
+                cpu_offload=cpu_offload,
+                param_init_fn=init_fn,
+                use_orig_params=False,
+                auto_wrap_policy=auto_wrap_policy,
+                device_id=get_device_id(),
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                mixed_precision=mixed_precision,
+                sync_module_states=True,
+                device_mesh=self.device_mesh,
+                forward_prefetch=False,
+            )
+            
+            # Step 4: Load state dict into new FSDP model
+            if self.device_mesh.get_rank() == 0:
+                print("Loading state dict into temporary model...")
+            
+            load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(temp_fsdp_model, StateDictType.FULL_STATE_DICT, load_policy):
+                if self.device_mesh.get_rank() == 0:
+                    temp_fsdp_model.load_state_dict(state_dict)
+                    
+        elif fsdp_strategy == "fsdp2":
+            from verl.utils.fsdp_utils import apply_fsdp2, CPUOffloadPolicy, MixedPrecisionPolicy, fsdp2_load_full_state_dict
+            
+            mp_policy = MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16, reduce_dtype=torch.float32, cast_forward_inputs=True
+            )
+            
+            fsdp_kwargs = {
+                "mesh": self.device_mesh,
+                "mp_policy": mp_policy,
+                "offload_policy": cpu_offload,
+                "reshard_after_forward": True,
+            }
+            
+            # Save full state before applying FSDP2
+            full_state = temp_model.state_dict() if state_dict is None else state_dict
+            
+            apply_fsdp2(temp_model, fsdp_kwargs, self.config.model.fsdp_config)
+            fsdp2_load_full_state_dict(temp_model, full_state, self.device_mesh, cpu_offload)
+            temp_fsdp_model = temp_model
+        else:
+            raise NotImplementedError(f"Strategy {fsdp_strategy} not implemented")
+        
+        # Sync across all ranks
+        torch.distributed.barrier()
+        
+        # Create optimizer for temp model
+        temp_optimizer = self._build_temp_optimizer(temp_fsdp_model)
+        
+        if self.device_mesh.get_rank() == 0:
+            print("Temporary model (q) created successfully.")
+        
+        return temp_fsdp_model, temp_optimizer
+    
+    def _build_temp_optimizer(self, model):
+        """Build optimizer for temporary model"""
+        from verl.workers.config.optimizer import build_optimizer
+        return build_optimizer(model.parameters(), self.config.optim)
+    
+    def _sample_sequence(self, model, input_ids, attention_mask, max_length=None):
+        """Sample a sequence from the model (for exploration)"""
+        model.eval()
+        
+        if max_length is None:
+            max_length = self.config.data.max_length
+        
+        with torch.no_grad():
+            # Simple greedy sampling (can be extended to other strategies)
+            generated = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_length=max_length,
+                do_sample=False,  # Greedy for stability
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+        
+        return generated
+    
+    def _get_token_logits(self, model, input_ids, attention_mask, position_ids):
+        """
+        Get logits for each token position from a model.
+        
+        Args:
+            model: Can be 'p0' (string) or an FSDP model instance
+            input_ids, attention_mask, position_ids: Input tensors
+        
+        Returns:
+            logits tensor
+        """
+        if isinstance(model, str) and model == 'p0':
+            # Special case: need to temporarily load p0 state
+            # We'll reuse temp_model for this to avoid creating another FSDP instance
+            # This should be called within _construct_soft_labels where temp_model is available
+            raise ValueError("Use _get_p0_logits() method instead for p0 reference")
+        
+        model.eval()
+        
+        with torch.no_grad(), torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+            output = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False
+            )
+            logits = output.logits
+        
+        return logits
+    
+    def _get_p0_and_q_logits(self, temp_model, input_ids, attention_mask, position_ids):
+        """
+        Get logits from both p0 (reference) and q (temp_model).
+        
+        To avoid creating multiple FSDP models, we:
+        1. Save current temp_model state
+        2. Load p0 state into temp_model
+        3. Get p0 logits
+        4. Restore temp_model state
+        5. Get q logits
+        
+        Args:
+            temp_model: The temporary FSDP model (q)
+            input_ids, attention_mask, position_ids: Input tensors
+        
+        Returns:
+            (logits_p0, logits_q): Tuple of logit tensors
+        """
+        if self.config.model.strategy == "fsdp":
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+            
+            # Step 1: Save current q state
+            save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(temp_model, StateDictType.FULL_STATE_DICT, save_policy):
+                q_state_dict = temp_model.state_dict()
+            
+            # Step 2: Load p0 state and get logits
+            self._load_reference_model_for_inference(temp_model)
+            logits_p0 = self._get_token_logits(temp_model, input_ids, attention_mask, position_ids)
+            
+            # Step 3: Restore q state
+            load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(temp_model, StateDictType.FULL_STATE_DICT, load_policy):
+                if self.device_mesh.get_rank() == 0:
+                    temp_model.load_state_dict(q_state_dict)
+            torch.distributed.barrier()
+            
+        elif self.config.model.strategy == "fsdp2":
+            # Step 1: Save current q state
+            if self.device_mesh.get_rank() == 0:
+                q_state_dict = temp_model.state_dict()
+            else:
+                q_state_dict = None
+            
+            # Step 2: Load p0 state and get logits
+            self._load_reference_model_for_inference(temp_model)
+            logits_p0 = self._get_token_logits(temp_model, input_ids, attention_mask, position_ids)
+            
+            # Step 3: Restore q state
+            if self.device_mesh.get_rank() == 0:
+                temp_model.load_state_dict(q_state_dict)
+            torch.distributed.barrier()
+        else:
+            raise NotImplementedError(f"Strategy {self.config.model.strategy} not implemented")
+        
+        # Step 4: Get q logits
+        logits_q = self._get_token_logits(temp_model, input_ids, attention_mask, position_ids)
+        
+        return logits_p0, logits_q
+    
+    def _construct_soft_labels(self, batch, temp_model, outer_iter):
+        """
+        Construct soft labels by geometric averaging p0 and q distributions.
+        
+        Args:
+            batch: Current batch with gold data
+            temp_model: Temporary SFT model q
+            outer_iter: Current outer iteration (for dynamic alpha)
+        
+        Returns:
+            Batch with soft labels added
+        """
+        input_ids = batch["input_ids"].to(self.device_name)
+        attention_mask = batch["attention_mask"].to(self.device_name)
+        position_ids = batch["position_ids"].to(self.device_name)
+        
+        # Decide whether to use gold answer or sample from q
+        use_gold = torch.rand(1).item() < self.soft_label_sample_ratio
+        
+        if use_gold:
+            # Use gold answer sequence
+            sequence_ids = input_ids
+        else:
+            # Sample from q (exploration)
+            sequence_ids = self._sample_sequence(temp_model, input_ids, attention_mask)
+            # Ensure same shape as input_ids
+            if sequence_ids.shape[1] > input_ids.shape[1]:
+                sequence_ids = sequence_ids[:, :input_ids.shape[1]]
+            elif sequence_ids.shape[1] < input_ids.shape[1]:
+                # Pad if needed
+                pad_length = input_ids.shape[1] - sequence_ids.shape[1]
+                sequence_ids = F.pad(sequence_ids, (0, pad_length), value=self.tokenizer.pad_token_id)
+        
+        # Get logits from both p0 and q
+        # This method handles the complexity of loading/unloading p0 state
+        logits_p0, logits_q = self._get_p0_and_q_logits(
+            temp_model, sequence_ids, attention_mask, position_ids
+        )
+        
+        # Compute soft labels via geometric averaging
+        # log p* = (1-alpha) * log p0 + alpha * log q
+        log_p0 = F.log_softmax(logits_p0, dim=-1)
+        log_q = F.log_softmax(logits_q, dim=-1)
+        
+        # Dynamic alpha: gradually increase q's weight
+        if self.use_dynamic_alpha:
+            alpha = self.soft_label_alpha + 0.1 * outer_iter / self.n_outer_iterations
+            alpha = min(alpha, 0.9)  # Cap at 0.9
+        else:
+            alpha = self.soft_label_alpha
+        
+        log_p_star = (1 - alpha) * log_p0 + alpha * log_q
+        soft_labels = F.softmax(log_p_star, dim=-1)
+        
+        # Add soft labels to batch
+        batch["soft_labels"] = soft_labels
+        batch["sequence_ids"] = sequence_ids
+        batch["use_gold"] = use_gold
+        
+        return batch
+    
+    def _compute_soft_label_loss(self, batch):
+        """
+        Compute loss using soft labels (KL divergence).
+        
+        This replaces the standard cross-entropy loss with KL divergence
+        between model predictions and soft label distributions.
+        """
+        sequence_ids = batch["sequence_ids"].to(self.device_name)
+        attention_mask = batch["attention_mask"].to(self.device_name)
+        position_ids = batch["position_ids"].to(self.device_name)
+        soft_labels = batch["soft_labels"].to(self.device_name)
+        loss_mask = batch["loss_mask"][:, 1:].reshape(-1).to(self.device_name)
+        
+        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+            output = self.fsdp_model(
+                input_ids=sequence_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False
+            )
+            logits = output.logits
+            
+            # Prepare for loss calculation
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_soft_labels = soft_labels[..., 1:, :].contiguous()
+            
+            # Flatten
+            shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
+            shift_soft_labels = shift_soft_labels.view(-1, self.model.config.vocab_size)
+            
+            # Compute KL divergence: KL(soft_labels || model_predictions)
+            log_probs = F.log_softmax(shift_logits, dim=-1)
+            loss = F.kl_div(log_probs, shift_soft_labels, reduction='none')
+            loss = loss.sum(dim=-1)  # Sum over vocabulary
+            
+            # Apply loss mask
+            loss = loss * loss_mask
+            
+            valid_tokens = torch.sum(loss_mask)
+            
+            if self.config.data.balance_dp_token:
+                torch.distributed.all_reduce(valid_tokens)
+                dp_size = self.device_mesh.size(0)
+            else:
+                dp_size = 1
+            
+            loss = torch.sum(loss) / (valid_tokens + 1e-8) * dp_size
+        
+        return loss
+    
+    def training_step_stage1(self, batch, temp_model, temp_optimizer):
+        """
+        Stage 1: Train on original data D to get q.
+        This is similar to standard SFT but on temporary model.
+        """
+        temp_model.train()
+        temp_optimizer.zero_grad()
+        
+        # Use parent's loss computation method but with temp_model
+        # We need to temporarily swap models
+        original_model = self.fsdp_model
+        self.fsdp_model = temp_model
+        
+        loss = self._compute_loss_and_backward(batch, do_backward=True, n_micro_batches=1)
+        
+        # Restore original model
+        self.fsdp_model = original_model
+        
+        # Clip gradients and step
+        if self.config.model.strategy == "fsdp":
+            temp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
+        elif self.config.model.strategy == "fsdp2":
+            from verl.utils.fsdp_utils import fsdp2_clip_grad_norm_
+            fsdp2_clip_grad_norm_(temp_model.parameters(), max_norm=self.config.optim.clip_grad)
+        
+        temp_optimizer.step()
+        
+        return loss.item()
+    
+    def training_step_stage3(self, batch):
+        """
+        Stage 3: Train p on soft-labeled data.
+        """
+        self.fsdp_model.train()
+        self.optimizer.zero_grad()
+        
+        loss = self._compute_soft_label_loss(batch)
+        loss.backward()
+        
+        # Clip gradients
+        if self.config.model.strategy == "fsdp":
+            self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
+        elif self.config.model.strategy == "fsdp2":
+            from verl.utils.fsdp_utils import fsdp2_clip_grad_norm_
+            fsdp2_clip_grad_norm_(self.fsdp_model.parameters(), max_norm=self.config.optim.clip_grad)
+        
+        self.optimizer.step()
+        self.lr_scheduler.step()
+        
+        return loss.item()
+    
+    def fit_anti_forgetting(self):
+        """
+        Main training loop with anti-forgetting mechanism.
+        
+        Outer loop structure:
+        for outer_iter in range(n_outer_iterations):
+            1. Create temp model q from p
+            2. Train q on D (Stage 1)
+            3. Construct soft labels from p0 and q (Stage 2)
+            4. Train p on soft labels (Stage 3)
+        """
+        rank = self.device_mesh.get_rank()
+        
+        # Initialize tracking
+        if rank == 0:
+            from verl.utils.tracking import Tracking
+            from omegaconf import OmegaConf
+            
+            tracking = Tracking(
+                project_name=self.config.trainer.project_name,
+                experiment_name=self.config.trainer.experiment_name + "_anti_forgetting",
+                default_backend=self.config.trainer.logger,
+                config=OmegaConf.to_container(self.config, resolve=True),
+            )
+        
+        global_step = self.resume_global_step
+        
+        # Outer iterations
+        for outer_iter in range(self.n_outer_iterations):
+            if rank == 0:
+                print(f"\n{'='*60}")
+                print(f"Outer Iteration {outer_iter + 1}/{self.n_outer_iterations}")
+                print(f"{'='*60}")
+            
+            # ================== Stage 1: Create and train q ==================
+            if rank == 0:
+                print(f"\n[Stage 1] Training temporary model q on original data...")
+            
+            temp_model, temp_optimizer = self._create_temp_sft_model()
+            
+            stage1_losses = []
+            self.train_sampler.set_epoch(epoch=outer_iter * 2)  # Different seed each outer iter
+            
+            for step, data in enumerate(tqdm(
+                self.train_dataloader,
+                desc=f"Stage 1 (Outer {outer_iter+1})",
+                disable=rank != 0
+            )):
+                data = TensorDict(data, batch_size=self.config.data.train_batch_size).to(self.device_name)
+                loss = self.training_step_stage1(data, temp_model, temp_optimizer)
+                stage1_losses.append(loss)
+                
+                global_step += 1
+                
+                if rank == 0 and step % 10 == 0:
+                    tracking.log({"stage1/loss": loss}, step=global_step)
+            
+            avg_stage1_loss = sum(stage1_losses) / len(stage1_losses)
+            if rank == 0:
+                print(f"Stage 1 completed. Avg loss: {avg_stage1_loss:.4f}")
+            
+            # ================== Stage 2: Construct soft labels ==================
+            if rank == 0:
+                print(f"\n[Stage 2] Constructing soft labels from p0 and q...")
+            
+            soft_label_dataset = []
+            self.train_sampler.set_epoch(epoch=outer_iter * 2 + 1)
+            
+            for step, data in enumerate(tqdm(
+                self.train_dataloader,
+                desc=f"Stage 2 (Outer {outer_iter+1})",
+                disable=rank != 0
+            )):
+                data = TensorDict(data, batch_size=self.config.data.train_batch_size).to(self.device_name)
+                
+                # Construct soft labels
+                soft_batch = self._construct_soft_labels(data, temp_model, outer_iter)
+                soft_label_dataset.append(soft_batch.cpu())
+                
+                if rank == 0 and step == 0:
+                    gold_ratio = sum([b["use_gold"].item() for b in [soft_batch]]) / len([soft_batch])
+                    print(f"Sample: Using gold answers: {gold_ratio:.2%}")
+            
+            if rank == 0:
+                print(f"Stage 2 completed. Constructed {len(soft_label_dataset)} soft-labeled batches.")
+            
+            # Clean up temp model
+            del temp_model, temp_optimizer
+            torch.cuda.empty_cache()
+            
+            # ================== Stage 3: Train p on soft labels ==================
+            if rank == 0:
+                print(f"\n[Stage 3] Training policy model p on soft labels...")
+            
+            stage3_losses = []
+            for step, soft_batch in enumerate(tqdm(
+                soft_label_dataset,
+                desc=f"Stage 3 (Outer {outer_iter+1})",
+                disable=rank != 0
+            )):
+                soft_batch = soft_batch.to(self.device_name)
+                loss = self.training_step_stage3(soft_batch)
+                stage3_losses.append(loss)
+                
+                global_step += 1
+                
+                if rank == 0 and step % 10 == 0:
+                    tracking.log({"stage3/loss": loss}, step=global_step)
+            
+            avg_stage3_loss = sum(stage3_losses) / len(stage3_losses)
+            if rank == 0:
+                print(f"Stage 3 completed. Avg loss: {avg_stage3_loss:.4f}")
+            
+            # Validation after each outer iteration
+            if rank == 0:
+                print(f"\n[Validation] Running validation...")
+            
+            val_losses = []
+            for val_data in self.val_dataloader:
+                val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).to(
+                    self.device_name
+                )
+                val_loss = self.validation_step(val_data)
+                val_losses.append(val_loss)
+            
+            if rank == 0:
+                val_loss = torch.mean(torch.stack(val_losses))
+                print(f"Validation loss: {val_loss.item():.4f}")
+                tracking.log({
+                    "val/loss": val_loss.item(),
+                    "outer_iteration": outer_iter + 1,
+                    "stage1/avg_loss": avg_stage1_loss,
+                    "stage3/avg_loss": avg_stage3_loss,
+                }, step=global_step)
+            
+            # Save checkpoint after each outer iteration
+            self.save_checkpoint(step=global_step)
+            
+            torch.distributed.barrier()
+        
+        if rank == 0:
+            print(f"\n{'='*60}")
+            print(f"Anti-Forgetting Training Completed!")
+            print(f"Total outer iterations: {self.n_outer_iterations}")
+            print(f"Final global step: {global_step}")
+            print(f"{'='*60}")
+
+
+def run_anti_forgetting_sft(config):
+    """Main entry point for anti-forgetting SFT training"""
+    from verl.utils.device import get_device_name
+    from verl.utils.distributed import initialize_global_process_group, destroy_global_process_group
+    from torch.distributed.device_mesh import init_device_mesh
+    from verl.utils.fs import copy_to_local
+    from verl.utils import hf_tokenizer
+    
+    device_name = get_device_name()
+    local_rank, rank, world_size = initialize_global_process_group()
+    
+    device_mesh = init_device_mesh(device_type=device_name, mesh_shape=(world_size,), mesh_dim_names=("fsdp",))
+    
+    dp_size = world_size // config.ulysses_sequence_parallel_size
+    ulysses_device_mesh = init_device_mesh(
+        device_type=device_name,
+        mesh_shape=(dp_size, config.ulysses_sequence_parallel_size),
+        mesh_dim_names=("dp", "sp"),
+    )
+    
+    # Build tokenizer and datasets
+    local_model_path = copy_to_local(src=config.model.partial_pretrain, verbose=True)
+    tokenizer = hf_tokenizer(local_model_path, trust_remote_code=config.model.trust_remote_code)
+    
+    train_dataset = create_sft_dataset(
+        config.data.train_files, 
+        config.data, 
+        tokenizer, 
+        max_samples=config.data.get("train_max_samples", -1)
+    )
+    val_dataset = create_sft_dataset(
+        config.data.val_files, 
+        config.data, 
+        tokenizer, 
+        max_samples=config.data.get("val_max_samples", -1)
+    )
+    
+    # Create anti-forgetting trainer
+    trainer = AntiForgettingSFTTrainer(
+        config=config,
+        device_mesh=device_mesh,
+        ulysses_device_mesh=ulysses_device_mesh,
+        tokenizer=tokenizer,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+    )
+    
+    # Run anti-forgetting training
+    trainer.fit_anti_forgetting()
+    
+    destroy_global_process_group()
+
 @hydra.main(config_path="config", config_name="sft_trainer", version_base=None)
 def main(config):
-    run_sft(config)
+    use_migiting_forget = config.get("use_migiting_forget", None)
+    
+    print(f"********\nUse mitigating forget: {use_migiting_forget}\n********")
+
+    if use_migiting_forget:
+        run_anti_forgetting_sft(config)
+    else:
+        run_sft(config)
 
 
 def create_sft_dataset(data_paths, data_config, tokenizer, max_samples=-1):
