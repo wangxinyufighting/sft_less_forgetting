@@ -1,8 +1,8 @@
 set -x
 
 ts=$(date '+%Y%m%d_%H%M%S') 
-model_name=Qwen2.5-3B-Instruct
-n_outer_iterations=3
+model_name=Qwen2.5-1.5B-Instruct
+n_outer_iterations=10
 soft_label_alpha=0.5
 use_dynamic_alpha=false
 soft_label_sample_ratio=0.0
@@ -22,6 +22,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun  --nproc_per_node=2 -m \
     +data.response_dict_keys=['answer'] \
     data.micro_batch_size=4 \
     model.partial_pretrain=/mnt/local/wxy/models/$model_name \
+    model.fsdp_config.model_dtype=bf16 \
     trainer.project_name=iGSM-sft \
     trainer.experiment_name=$experiment_name \
     trainer.total_epochs=5 \
@@ -30,8 +31,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun  --nproc_per_node=2 -m \
     trainer.save_freq=20 \
     trainer.checkpoint.save_contents=["hf_model"]\
     optim.lr=1e-6 \
-    +use_migiting_forget=$use_migiting_forget \
-    +n_outer_iterations=$n_outer_iterations\
-    +soft_label_alpha=$soft_label_alpha\
-    +use_dynamic_alpha=$use_dynamic_alpha\
-    +soft_label_sample_ratio=$soft_label_sample_ratio
+    +trainer.anti_forgetting=$use_migiting_forget \
+    +anti_forgetting.n_outer=$n_outer_iterations\
+    +anti_forgetting.alpha=$soft_label_alpha\
+    +anti_forgetting.q_sample_ratio=$soft_label_sample_ratio
