@@ -60,6 +60,10 @@ from verl.utils.fsdp_utils import (
     fsdp2_clip_grad_norm_,
     fsdp2_load_full_state_dict,
     get_fsdp_full_state_dict,
+    load_fsdp_model_to_gpu,
+    load_fsdp_optimizer,
+    offload_fsdp_model_to_cpu,
+    offload_fsdp_optimizer,
     get_fsdp_wrap_policy,
     get_init_weight_context_manager,
     init_fn,
@@ -852,6 +856,7 @@ class AntiForgettingSFTTrainer(FSDPSFTTrainer):
         self.soft_label_sample_ratio = float(min(max(gold_ratio, 0.0), 1.0))
 
         self._init_reference_model()
+        offload_fsdp_model_to_cpu(self.reference_model)
 
         if self.device_mesh.get_rank() == 0:
             print("Anti-Forgetting configuration:")
@@ -942,6 +947,18 @@ class AntiForgettingSFTTrainer(FSDPSFTTrainer):
 
         return clone
 
+    def _load_model_state(self, model, state_dict):
+        if self._fsdp_strategy == "fsdp":
+            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+
+            load_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
+            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, load_cfg):
+                model.load_state_dict(state_dict)
+        elif self._fsdp_strategy == "fsdp2":
+            fsdp2_load_full_state_dict(model, state_dict, self.device_mesh, self._fsdp2_cpu_offload)
+        else:
+            raise NotImplementedError(f"Unsupported FSDP strategy {self._fsdp_strategy}")
+
     def _init_reference_model(self) -> None:
         """Freeze a copy of the initial model as the reference policy p0."""
         if self.device_mesh.get_rank() == 0:
@@ -954,11 +971,9 @@ class AntiForgettingSFTTrainer(FSDPSFTTrainer):
         if self.device_mesh.get_rank() == 0:
             print("Reference model ready and frozen.")
 
-    def _create_temp_sft_model(self):
+    def _create_temp_sft_model(self, state_dict):
         """Create the temporary model q used during Stage 1."""
-        current_state = get_fsdp_full_state_dict(self.fsdp_model, offload_to_cpu=True, rank0_only=False)
-        temp_model = self._create_model_clone_from_state(current_state, requires_grad=True)
-        del current_state
+        temp_model = self._create_model_clone_from_state(state_dict, requires_grad=True)
         temp_optimizer = self._build_temp_optimizer(temp_model)
         return temp_model, temp_optimizer
 
@@ -1087,13 +1102,14 @@ class AntiForgettingSFTTrainer(FSDPSFTTrainer):
     def training_step_stage1(self, batch: TensorDict, temp_model, temp_optimizer):
         temp_model.train()
         temp_optimizer.zero_grad()
-
-        original_model = self.fsdp_model
-        self.fsdp_model = temp_model
-
-        loss = self._compute_loss_and_backward(batch=batch, do_backward=True, n_micro_batches=1)
-
-        self.fsdp_model = original_model
+        micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
+        n_micro_batches = len(micro_batches)
+        step_loss = 0.0
+        for micro_batch in micro_batches:
+            loss = self._compute_loss_and_backward(
+                batch=micro_batch, do_backward=True, n_micro_batches=n_micro_batches
+            )
+            step_loss += loss.item()
 
         if self.config.model.strategy == "fsdp":
             temp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
@@ -1101,7 +1117,7 @@ class AntiForgettingSFTTrainer(FSDPSFTTrainer):
             fsdp2_clip_grad_norm_(temp_model.parameters(), max_norm=self.config.optim.clip_grad)
 
         temp_optimizer.step()
-        return loss.item()
+        return step_loss
 
     def training_step_stage3(self, batch: TensorDict):
         self.fsdp_model.train()
@@ -1138,7 +1154,14 @@ class AntiForgettingSFTTrainer(FSDPSFTTrainer):
                 print(f"Outer iteration {outer_iter + 1}/{self.n_outer_iterations}")
                 print("=" * 60)
 
-            temp_model, temp_optimizer = self._create_temp_sft_model()
+            # Save current policy state and offload to CPU to free GPU memory
+            policy_state = get_fsdp_full_state_dict(self.fsdp_model, offload_to_cpu=True, rank0_only=False)
+            offload_fsdp_optimizer(self.optimizer)
+            offload_fsdp_model_to_cpu(self.fsdp_model)
+
+            temp_model, temp_optimizer = self._create_temp_sft_model(policy_state)
+            policy_model = self.fsdp_model
+            self.fsdp_model = temp_model
             stage1_losses = []
             self.train_sampler.set_epoch(epoch=outer_iter * 2)
 
@@ -1161,6 +1184,9 @@ class AntiForgettingSFTTrainer(FSDPSFTTrainer):
             if rank == 0:
                 print(f"Stage 1 completed. Avg loss: {avg_stage1_loss:.4f}")
 
+            temp_model.eval()
+            load_fsdp_model_to_gpu(self.reference_model)
+
             soft_label_batches = []
             self.train_sampler.set_epoch(epoch=outer_iter * 2 + 1)
 
@@ -1178,9 +1204,16 @@ class AntiForgettingSFTTrainer(FSDPSFTTrainer):
                 if rank == 0 and step == 0:
                     print(f"Stage 2 sample uses gold: {soft_batch['use_gold'].item()!s}")
 
+            offload_fsdp_model_to_cpu(self.reference_model)
             del temp_model, temp_optimizer
             if is_cuda_available:
                 torch.cuda.empty_cache()
+
+            self.fsdp_model = policy_model
+            load_fsdp_model_to_gpu(self.fsdp_model)
+            self._load_model_state(self.fsdp_model, policy_state)
+            load_fsdp_optimizer(self.optimizer, get_device_id())
+            del policy_state
 
             if rank == 0:
                 print(f"Stage 2 completed. Batches prepared: {len(soft_label_batches)}")
