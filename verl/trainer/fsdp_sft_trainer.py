@@ -177,6 +177,15 @@ class FSDPSFTTrainer:
         # Set pin_memory_device when pin_memory is enabled.
         device_name = get_device_name()
 
+        # Choose a conservative default for num_workers to avoid excessive
+        # system memory / worker processes that can trigger the OOM killer.
+        # Allow overriding from config.data.num_workers when provided.
+        default_workers = min(4, max(1, (os.cpu_count() or 1) // 2))
+        num_workers = getattr(config.data, "num_workers", default_workers)
+
+        if self.device_mesh.get_rank() == 0:
+            print(f"DataLoader num_workers set to: {num_workers}")
+
         self.train_sampler = DistributedSampler(
             self.train_dataset, shuffle=True, num_replicas=world_size, rank=rank, drop_last=True
         )
@@ -184,7 +193,7 @@ class FSDPSFTTrainer:
             dataset=self.train_dataset,
             batch_size=config.data.train_batch_size,
             sampler=self.train_sampler,
-            num_workers=8,
+            num_workers=num_workers,
             pin_memory=True,
             drop_last=True,
             pin_memory_device=device_name,
@@ -197,7 +206,7 @@ class FSDPSFTTrainer:
             dataset=self.val_dataset,
             batch_size=config.data.micro_batch_size_per_gpu,
             sampler=self.val_sampler,
-            num_workers=8,
+            num_workers=num_workers,
             pin_memory=True,
             drop_last=True,
             pin_memory_device=device_name,
@@ -1055,11 +1064,13 @@ class AntiForgettingSFTTrainer(FSDPSFTTrainer):
             alpha = self.soft_label_alpha
 
         log_p_star = (1.0 - alpha) * log_p0 + alpha * log_q
-        soft_labels = F.softmax(log_p_star, dim=-1)
+        soft_labels = F.softmax(log_p_star, dim=-1).to(torch.bfloat16)
 
+        batch_size = input_ids.shape[0]
         batch["sequence_ids"] = sequence_ids
         batch["soft_labels"] = soft_labels
-        batch["use_gold"] = torch.tensor(use_gold, device=self.device_name, dtype=torch.bool)
+        use_gold_tensor = torch.full((batch_size,), use_gold, device=self.device_name, dtype=torch.bool)
+        batch["use_gold"] = use_gold_tensor
         return batch
 
     def _compute_soft_label_loss(self, batch: TensorDict) -> torch.Tensor:
@@ -1082,7 +1093,7 @@ class AntiForgettingSFTTrainer(FSDPSFTTrainer):
             shift_soft_labels = soft_labels[..., 1:, :].contiguous()
 
             shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
-            shift_soft_labels = shift_soft_labels.view(-1, self.model.config.vocab_size)
+            shift_soft_labels = shift_soft_labels.view(-1, self.model.config.vocab_size).to(shift_logits.dtype)
 
             log_probs = F.log_softmax(shift_logits, dim=-1)
             loss = F.kl_div(log_probs, shift_soft_labels, reduction="none", log_target=False)
@@ -1189,6 +1200,7 @@ class AntiForgettingSFTTrainer(FSDPSFTTrainer):
 
             soft_label_batches = []
             self.train_sampler.set_epoch(epoch=outer_iter * 2 + 1)
+            logged_soft_label = False
 
             for step, data in enumerate(
                 tqdm(
@@ -1198,11 +1210,24 @@ class AntiForgettingSFTTrainer(FSDPSFTTrainer):
                 )
             ):
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size)
-                soft_batch = self._construct_soft_labels(data, temp_model, outer_iter)
-                soft_label_batches.append(soft_batch.cpu())
+                micro_batches = data.split(self.config.data.micro_batch_size_per_gpu)
+                for micro_batch in micro_batches:
+                    micro_batch = micro_batch.to(self.device_name)
+                    soft_batch = self._construct_soft_labels(micro_batch, temp_model, outer_iter).detach()
+                    soft_batch["soft_labels"] = soft_batch["soft_labels"].float()
+                    cpu_tensors = {
+                        key: value.detach().cpu()
+                        for key, value in soft_batch.items()
+                    }
+                    cpu_batch = TensorDict(cpu_tensors, batch_size=soft_batch.batch_size, device="cpu")
+                    soft_label_batches.append(cpu_batch)
 
-                if rank == 0 and step == 0:
-                    print(f"Stage 2 sample uses gold: {soft_batch['use_gold'].item()!s}")
+                    if rank == 0 and not logged_soft_label:
+                        print(f"Stage 2 sample uses gold: {soft_batch['use_gold'].item()!s}")
+                        logged_soft_label = True
+
+                    if is_cuda_available:
+                        torch.cuda.empty_cache()
 
             offload_fsdp_model_to_cpu(self.reference_model)
             del temp_model, temp_optimizer
