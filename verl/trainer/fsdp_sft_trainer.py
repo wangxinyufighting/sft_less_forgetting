@@ -23,6 +23,10 @@ import os
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
+import warnings
+
+warnings.filterwarnings('ignore')
+
 import logging
 import re
 import time
@@ -31,7 +35,6 @@ from contextlib import nullcontext
 import hydra
 import torch
 import torch.distributed
-import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from peft import LoraConfig, TaskType, get_peft_model
 from tensordict import TensorDict
@@ -59,11 +62,6 @@ from verl.utils.fsdp_utils import (
     apply_fsdp2,
     fsdp2_clip_grad_norm_,
     fsdp2_load_full_state_dict,
-    get_fsdp_full_state_dict,
-    load_fsdp_model_to_gpu,
-    load_fsdp_optimizer,
-    offload_fsdp_model_to_cpu,
-    offload_fsdp_optimizer,
     get_fsdp_wrap_policy,
     get_init_weight_context_manager,
     init_fn,
@@ -81,6 +79,7 @@ from verl.utils.ulysses import (
 )
 from verl.workers.config.optimizer import build_optimizer
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
+import torch.nn.functional as F
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
@@ -140,6 +139,31 @@ class FSDPSFTTrainer:
             print(self.config)
         self.device_name = self.config.trainer.device
 
+        self.n_outer_iterations = getattr(self.config.trainer, "n_outer_iterations", None)
+        if self.n_outer_iterations is None:
+            raise ValueError("anti_forgetting.n_outer (or trainer.n_outer_iterations) must be provided")
+        self.n_outer_iterations = int(self.n_outer_iterations)
+
+        gold_ratio = getattr(self.config.trainer, "gold_sample_ratio", None)
+        if gold_ratio is None:
+            raise ValueError("trainer.gold_sample_ratio must be provided")
+        self.soft_label_gold_ratio = float(min(max(gold_ratio, 0.0), 1.0))
+
+        self.use_dynamic_alpha = getattr(self.config.trainer, "use_dynamic_alpha", None)
+        if self.use_dynamic_alpha is None:
+            raise ValueError("trainer.use_dynamic_alpha must be provided")
+        self.use_dynamic_alpha = bool(self.use_dynamic_alpha)
+
+        self.soft_label_alpha = getattr(self.config.trainer, "soft_label_alpha", None)
+        if self.soft_label_alpha is None:
+            raise ValueError("trainer.soft_label_alpha must be provided")
+        self.soft_label_alpha = float(self.soft_label_alpha)
+
+        self.anti_forgetting = getattr(self.config.trainer, "anti_forgetting", None)
+        if self.anti_forgetting is None:
+            raise ValueError("trainer.anti_forgetting must be provided")
+        self.anti_forgetting = bool(self.anti_forgetting)
+
     def _normalize_config_bsz(self):
         dp_size = self.device_mesh.size(0) if not self.ulysses_device_mesh else self.ulysses_device_mesh.size(0)
         if self.device_mesh.get_rank() == 0:
@@ -177,15 +201,6 @@ class FSDPSFTTrainer:
         # Set pin_memory_device when pin_memory is enabled.
         device_name = get_device_name()
 
-        # Choose a conservative default for num_workers to avoid excessive
-        # system memory / worker processes that can trigger the OOM killer.
-        # Allow overriding from config.data.num_workers when provided.
-        default_workers = min(4, max(1, (os.cpu_count() or 1) // 2))
-        num_workers = getattr(config.data, "num_workers", default_workers)
-
-        if self.device_mesh.get_rank() == 0:
-            print(f"DataLoader num_workers set to: {num_workers}")
-
         self.train_sampler = DistributedSampler(
             self.train_dataset, shuffle=True, num_replicas=world_size, rank=rank, drop_last=True
         )
@@ -193,7 +208,7 @@ class FSDPSFTTrainer:
             dataset=self.train_dataset,
             batch_size=config.data.train_batch_size,
             sampler=self.train_sampler,
-            num_workers=num_workers,
+            num_workers=8,
             pin_memory=True,
             drop_last=True,
             pin_memory_device=device_name,
@@ -206,7 +221,7 @@ class FSDPSFTTrainer:
             dataset=self.val_dataset,
             batch_size=config.data.micro_batch_size_per_gpu,
             sampler=self.val_sampler,
-            num_workers=num_workers,
+            num_workers=8,
             pin_memory=True,
             drop_last=True,
             pin_memory_device=device_name,
@@ -217,7 +232,6 @@ class FSDPSFTTrainer:
         # 1. support pretrain from random weights
         # 2. support init directly from sharded weights
         local_model_path = copy_to_local(src=self.config.model.partial_pretrain, verbose=True)
-        self.local_model_path = local_model_path
 
         if self.config.model.get("external_lib", None) is not None:
             # This is used to import external_lib into the huggingface systems
@@ -230,7 +244,6 @@ class FSDPSFTTrainer:
         trust_remote_code = self.config.model.trust_remote_code
         torch_dtype = self.config.model.fsdp_config.get("model_dtype", "fp32")
         torch_dtype = PrecisionType.to_dtype(torch_dtype)
-        self.model_dtype = torch_dtype
         # load config first
         config = AutoConfig.from_pretrained(local_model_path, trust_remote_code=trust_remote_code)
         self.model_config = config
@@ -255,19 +268,36 @@ class FSDPSFTTrainer:
                 trust_remote_code=trust_remote_code,
             )
 
+            self.model_for_sft = AutoModelForCausalLM.from_pretrained(
+                local_model_path, # 或者从另一个路径加载
+                config=config,
+                torch_dtype=torch_dtype,
+                attn_implementation="flash_attention_2",
+                trust_remote_code=trust_remote_code,
+            )
+
+            self.model_for_reference = AutoModelForCausalLM.from_pretrained(
+                local_model_path, # 或者从另一个路径加载
+                config=config,
+                torch_dtype=torch_dtype,
+                attn_implementation="flash_attention_2",
+                trust_remote_code=trust_remote_code,
+            ) 
+
             if self.use_remove_padding or self.config.ulysses_sequence_parallel_size > 1:
                 from verl.models.transformers.monkey_patch import apply_monkey_patch
 
                 apply_monkey_patch(model=self.model, ulysses_sp_size=self.config.ulysses_sequence_parallel_size)
+                apply_monkey_patch(model=self.model_for_sft, ulysses_sp_size=self.config.ulysses_sequence_parallel_size)
+                apply_monkey_patch(model=self.model_for_reference, ulysses_sp_size=self.config.ulysses_sequence_parallel_size)
 
             # Apply Liger kernel if use_liger is enabled
             if self.config.model.get("use_liger", False):
                 from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
 
                 _apply_liger_kernel_to_instance(model=self.model)
-
-            self._lora_adapter_path = None
-            self._lora_config_kwargs = None
+                _apply_liger_kernel_to_instance(model=self.model_for_sft)
+                _apply_liger_kernel_to_instance(model=self.model_for_reference)
 
             if self.lora:
                 self.model.enable_input_require_grads()
@@ -281,7 +311,6 @@ class FSDPSFTTrainer:
                     local_adapter_path = copy_to_local(lora_adapter_path, use_shm=self.config.model.use_shm)
 
                     self.model = PeftModel.from_pretrained(self.model, local_adapter_path, is_trainable=True)
-                    self._lora_adapter_path = local_adapter_path
                     peft_config = self.model.peft_config["default"]
                     # Ensure task_type is TaskType enum, not string
                     if isinstance(peft_config.task_type, str):
@@ -295,26 +324,24 @@ class FSDPSFTTrainer:
                         "target_modules": convert_to_regular_types(self.config.model.target_modules),
                         "bias": "none",
                     }
-                    self._lora_config_kwargs = lora_config
                     self.model = get_peft_model(self.model, LoraConfig(**lora_config))
                 self.model = self.model.to(torch_dtype)
 
         if self.config.model.enable_gradient_checkpointing:
             self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            self.model_for_sft.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
         log_gpu_memory_usage("After model allocation", logger=logger)
 
         mixed_precision = MixedPrecision(
             param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.float32
         )
-        self._fsdp_mixed_precision = mixed_precision
 
         auto_wrap_policy = get_fsdp_wrap_policy(
             self.model,
             config=self.config.model.fsdp_config.wrap_policy,
             is_lora=self.lora,
         )
-        self._fsdp_auto_wrap_policy = auto_wrap_policy
 
         if self.device_mesh.get_rank() == 0:
             print(auto_wrap_policy)
@@ -323,12 +350,8 @@ class FSDPSFTTrainer:
             cpu_offload = None
         else:
             cpu_offload = CPUOffload(offload_params=self.config.model.fsdp_config.offload_params)
-        self._fsdp_cpu_offload = cpu_offload
 
         fsdp_strategy = self.config.model.strategy
-        self._fsdp_strategy = fsdp_strategy
-        self._fsdp2_kwargs = None
-        self._fsdp2_cpu_offload = None
         if fsdp_strategy == "fsdp":
             self.fsdp_model = FSDP(
                 self.model,
@@ -343,6 +366,33 @@ class FSDPSFTTrainer:
                 device_mesh=self.device_mesh,
                 forward_prefetch=False,
             )
+            self.fsdp_model_sft = FSDP(
+                self.model_for_sft,
+                cpu_offload=cpu_offload,
+                param_init_fn=init_fn,
+                use_orig_params=False,
+                auto_wrap_policy=auto_wrap_policy,
+                device_id=get_device_id(),
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                mixed_precision=mixed_precision,
+                sync_module_states=True,
+                device_mesh=self.device_mesh,
+                forward_prefetch=False,
+            )
+            self.fsdp_model_reference = FSDP(
+                self.model_for_reference,
+                cpu_offload=cpu_offload,
+                param_init_fn=init_fn,
+                use_orig_params=False,
+                auto_wrap_policy=auto_wrap_policy,
+                device_id=get_device_id(),
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                mixed_precision=mixed_precision,
+                sync_module_states=True,
+                device_mesh=self.device_mesh,
+                forward_prefetch=False,
+            )
+
         elif fsdp_strategy == "fsdp2":
             assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
             mp_policy = MixedPrecisionPolicy(
@@ -355,18 +405,29 @@ class FSDPSFTTrainer:
                 "offload_policy": cpu_offload,
                 "reshard_after_forward": True,
             }
-            self._fsdp2_kwargs = fsdp_kwargs
-            self._fsdp2_cpu_offload = cpu_offload
             full_state = self.model.state_dict()
             apply_fsdp2(self.model, fsdp_kwargs, self.config.model.fsdp_config)
             fsdp2_load_full_state_dict(self.model, full_state, self.device_mesh, cpu_offload)
             self.fsdp_model = self.model
+
+            apply_fsdp2(self.model_for_sft, fsdp_kwargs, self.config.model.fsdp_config)
+            fsdp2_load_full_state_dict(self.model_for_sft, full_state, self.device_mesh, cpu_offload)
+            self.fsdp_model_sft = self.model_for_sft
+
+            apply_fsdp2(self.model_for_reference, fsdp_kwargs, self.config.model.fsdp_config)
+            fsdp2_load_full_state_dict(self.model_for_reference, full_state, self.device_mesh, cpu_offload)
+            self.fsdp_model_reference = self.model_for_reference
+
+            # frozen
+            self.fsdp_model_reference.eval()
+            self.fsdp_model_reference.requires_grad_(False)
         else:
             raise NotImplementedError(f"not implement {fsdp_strategy}")
 
         log_gpu_memory_usage("After FSDP wrapping", logger=logger)
 
         self.optimizer = build_optimizer(self.fsdp_model.parameters(), self.config.optim)
+        self.optimizer_for_sft = build_optimizer(self.fsdp_model_sft.parameters(), self.config.optim)
 
         log_gpu_memory_usage("After initialize optimizer", logger=logger)
 
@@ -385,16 +446,91 @@ class FSDPSFTTrainer:
             self.lr_scheduler = get_cosine_schedule_with_warmup(
                 optimizer=self.optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps
             )
+            self.lr_scheduler_for_sft = get_cosine_schedule_with_warmup(
+                optimizer=self.optimizer_for_sft, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps
+            )
         elif self.config.optim.lr_scheduler == "wsd":
             self.lr_scheduler = get_wsd_schedule_with_warmup(
                 optimizer=self.optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps
             )
+            self.lr_scheduler_for_sft = get_wsd_schedule_with_warmup(
+                optimizer=self.optimizer_for_sft, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps
+            )
         else:
             raise ValueError(f"Unknown lr scheduler: {self.config.optim.lr_scheduler}")
 
-    def _compute_loss_and_backward(self, batch, do_backward=True, n_micro_batches=1):
+    def training_step_for_sft(self, batch: TensorDict, current_outer_iteration: int):
+        """
+        一个专门用于训练和更新 self.fsdp_model 的函数
+        """
+        start_time = time.time()
+        self.fsdp_model_sft.train() # 设置为训练模式
+
+        log_gpu_memory_usage("Before optimizer zero_grad", logger=logger)
+
+        self.optimizer_for_sft.zero_grad() # 使用新的优化器清零梯度
+
+        log_gpu_memory_usage("After optimizer zero_grad", logger=logger)
+
+        micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
+        n_micro_batches = len(micro_batches)
+        step_loss = 0
+
+        for micro_batch in micro_batches:
+        # micro_batch = micro_batches[current_outer_iteration]
+            loss = self._compute_loss_and_backward(
+                batch=micro_batch,
+                n_micro_batches=n_micro_batches,
+                model=self.fsdp_model_sft
+            )
+            step_loss += loss.item()
+
+        if self.config.model.strategy == "fsdp":
+            grad_norm = self.fsdp_model_sft.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
+        elif self.config.model.strategy == "fsdp2":
+            grad_norm = fsdp2_clip_grad_norm_(self.fsdp_model_sft.parameters(), max_norm=self.config.optim.clip_grad)
+        else:
+            raise NotImplementedError(f"not implement {self.config.model.strategy}")
+
+        log_gpu_memory_usage("Before optimizer step", logger=logger)
+
+        # 检查梯度是否有效
+        if not torch.isfinite(grad_norm):
+            print(f"WARN: grad_norm for 'fsdp_model_sft' is not finite: {grad_norm}")
+            self.optimizer_for_sft.zero_grad() # 如果梯度爆炸，就跳过更新
+        else:
+            # 使用新的优化器更新参数
+            self.optimizer_for_sft.step()
+
+        log_gpu_memory_usage("After optimizer step", logger=logger)
+
+        self.lr_scheduler_for_sft.step()
+
+        lr = self.lr_scheduler_for_sft.get_last_lr()[0]
+
+        log_gpu_memory_usage("After offload weights", logger=logger)
+
+        step_loss = torch.tensor(step_loss).to(self.device_name)
+        end_time = time.time()
+        spend_time_per_step = end_time - start_time
+
+        if is_cuda_available:
+            torch.distributed.all_reduce(step_loss, op=torch.distributed.ReduceOp.AVG)
+        elif is_npu_available:
+            torch.distributed.all_reduce(step_loss)
+            step_loss /= self.device_mesh.size(0)
+
+        return {
+            "fsdp_model_sft/train/loss": step_loss.detach().item(),
+            "train_for_sft/lr(1e-3)": lr * 1e3,
+            "train_for_sft/time(s)": spend_time_per_step,
+        }
+
+    def _compute_loss_and_backward(self, batch, do_backward=True, n_micro_batches=1, model=None):
         """Compute loss with optional sequence parallelism and remove padding features"""
         use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
+
+        model = model if model is not None else self.fsdp_model
 
         # Move inputs to GPU and prepare loss mask
         input_ids = batch["input_ids"].to(self.device_name)
@@ -409,7 +545,7 @@ class FSDPSFTTrainer:
             if not use_sp:
                 # Standard forward pass without sequence parallel
                 labels = input_ids[:, 1:].contiguous()
-                output = self.fsdp_model(
+                output = model(
                     input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False
                 )
                 logits = output.logits
@@ -454,7 +590,7 @@ class FSDPSFTTrainer:
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
 
                 # Forward pass
-                output = self.fsdp_model(
+                output = model(
                     input_ids=input_ids_rmpad_sliced,
                     attention_mask=None,  # Not needed with flash attention varlen
                     position_ids=position_ids_rmpad_padded,
@@ -630,6 +766,22 @@ class FSDPSFTTrainer:
             model=self.fsdp_model,
             optimizer=self.optimizer,
             lr_scheduler=self.lr_scheduler,
+            processing_class=self.tokenizer,
+            checkpoint_config=checkpoint_config_dict,
+        )
+
+        self.checkpoint_manager_for_sft = FSDPCheckpointManager(
+            model=self.fsdp_model_sft,
+            optimizer=self.optimizer_for_sft,
+            lr_scheduler=self.lr_scheduler,
+            processing_class=self.tokenizer,
+            checkpoint_config=checkpoint_config_dict,
+        )   
+
+        self.checkpoint_manager_reference = FSDPCheckpointManager(
+            model=self.fsdp_model_reference,
+            optimizer=None,
+            lr_scheduler=None,
             processing_class=self.tokenizer,
             checkpoint_config=checkpoint_config_dict,
         )
@@ -825,184 +977,14 @@ class FSDPSFTTrainer:
                         print(f"Final validation metrics: {last_valid_metric}")
                     return
 
-
-class AntiForgettingSFTTrainer(FSDPSFTTrainer):
-    """Extended trainer implementing the three-stage anti-forgetting loop."""
-
-    def __init__(
-        self,
-        config,
-        device_mesh: DeviceMesh,
-        ulysses_device_mesh: DeviceMesh,
-        tokenizer,
-        train_dataset: Dataset,
-        val_dataset: Dataset,
-    ):
-        super().__init__(config, device_mesh, ulysses_device_mesh, tokenizer, train_dataset, val_dataset)
-
-        anti_cfg = getattr(self.config, "anti_forgetting", None)
-        if isinstance(anti_cfg, DictConfig):
-            anti_cfg = OmegaConf.to_container(anti_cfg, resolve=True)
-        anti_cfg = anti_cfg or {}
-
-        # Core hyper parameters for the outer-loop schedule
-        self.n_outer_iterations = anti_cfg.get(
-            "n_outer", getattr(self.config.trainer, "n_outer_iterations", None)
-        )
-        if self.n_outer_iterations is None:
-            raise ValueError("anti_forgetting.n_outer (or trainer.n_outer_iterations) must be provided")
-        self.n_outer_iterations = int(self.n_outer_iterations)
-
-        self.soft_label_alpha = float(anti_cfg.get("alpha", 0.5))
-        self.use_dynamic_alpha = bool(anti_cfg.get("use_dynamic_alpha", False))
-
-        if "q_sample_ratio" in anti_cfg:
-            gold_ratio = 1.0 - float(anti_cfg["q_sample_ratio"])
-        elif "gold_sample_ratio" in anti_cfg:
-            gold_ratio = float(anti_cfg["gold_sample_ratio"])
-        else:
-            gold_ratio = float(anti_cfg.get("soft_label_sample_ratio", 0.8))
-        self.soft_label_sample_ratio = float(min(max(gold_ratio, 0.0), 1.0))
-
-        self._init_reference_model()
-        offload_fsdp_model_to_cpu(self.reference_model)
-
-        if self.device_mesh.get_rank() == 0:
-            print("Anti-Forgetting configuration:")
-            print(f"  outer iterations : {self.n_outer_iterations}")
-            print(f"  alpha            : {self.soft_label_alpha}")
-            print(f"  dynamic alpha    : {self.use_dynamic_alpha}")
-            print(f"  gold sample rate : {self.soft_label_sample_ratio:.2f}")
-
-    def _build_pretrained_model(self, trainable: bool):
-        trust_remote_code = self.config.model.trust_remote_code
-        config = AutoConfig.from_pretrained(self.local_model_path, trust_remote_code=trust_remote_code)
-        if hasattr(config, "max_position_embeddings"):
-            config.max_position_embeddings = max(
-                config.max_position_embeddings, self.config.data.max_length
-            )
-
-        model = AutoModelForCausalLM.from_pretrained(
-            self.local_model_path,
-            config=config,
-            torch_dtype=self.model_dtype,
-            attn_implementation="flash_attention_2",
-            trust_remote_code=trust_remote_code,
-        )
-
-        if self.use_remove_padding or self.config.ulysses_sequence_parallel_size > 1:
-            from verl.models.transformers.monkey_patch import apply_monkey_patch
-
-            apply_monkey_patch(model=model, ulysses_sp_size=self.config.ulysses_sequence_parallel_size)
-
-        if self.config.model.get("use_liger", False):
-            from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
-
-            _apply_liger_kernel_to_instance(model=model)
-
-        if self.lora:
-            model.enable_input_require_grads()
-            if self._lora_adapter_path is not None:
-                from peft import PeftModel
-
-                model = PeftModel.from_pretrained(model, self._lora_adapter_path, is_trainable=trainable)
-            else:
-                lora_cfg = LoraConfig(**self._lora_config_kwargs)
-                model = get_peft_model(model, lora_cfg)
-
-        model = model.to(self.model_dtype)
-
-        if trainable and self.config.model.enable_gradient_checkpointing:
-            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-
-        return model
-
-    def _create_model_clone_from_state(self, state_dict: dict, requires_grad: bool):
-        model = self._build_pretrained_model(trainable=requires_grad)
-
-        if self._fsdp_strategy == "fsdp":
-            clone = FSDP(
-                model,
-                cpu_offload=self._fsdp_cpu_offload,
-                param_init_fn=init_fn,
-                use_orig_params=False,
-                auto_wrap_policy=self._fsdp_auto_wrap_policy,
-                device_id=get_device_id(),
-                sharding_strategy=ShardingStrategy.FULL_SHARD,
-                mixed_precision=self._fsdp_mixed_precision,
-                sync_module_states=True,
-                device_mesh=self.device_mesh,
-                forward_prefetch=False,
-            )
-            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-
-            load_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
-            with FSDP.state_dict_type(clone, StateDictType.FULL_STATE_DICT, load_cfg):
-                clone.load_state_dict(state_dict)
-        elif self._fsdp_strategy == "fsdp2":
-            clone = model
-            fsdp_kwargs = dict(self._fsdp2_kwargs or {})
-            apply_fsdp2(clone, fsdp_kwargs, self.config.model.fsdp_config)
-            fsdp2_load_full_state_dict(clone, state_dict, self.device_mesh, self._fsdp2_cpu_offload)
-        else:
-            raise NotImplementedError(f"Unsupported FSDP strategy {self._fsdp_strategy} for anti-forgetting")
-
-        if not requires_grad:
-            for param in clone.parameters():
-                param.requires_grad = False
-            clone.eval()
-        else:
-            clone.train()
-
-        return clone
-
-    def _load_model_state(self, model, state_dict):
-        if self._fsdp_strategy == "fsdp":
-            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-
-            load_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
-            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, load_cfg):
-                model.load_state_dict(state_dict)
-        elif self._fsdp_strategy == "fsdp2":
-            fsdp2_load_full_state_dict(model, state_dict, self.device_mesh, self._fsdp2_cpu_offload)
-        else:
-            raise NotImplementedError(f"Unsupported FSDP strategy {self._fsdp_strategy}")
-
-    def _init_reference_model(self) -> None:
-        """Freeze a copy of the initial model as the reference policy p0."""
-        if self.device_mesh.get_rank() == 0:
-            print("Initializing frozen reference model (p0)...")
-
-        reference_state = get_fsdp_full_state_dict(self.fsdp_model, offload_to_cpu=True, rank0_only=False)
-        self.reference_model = self._create_model_clone_from_state(reference_state, requires_grad=False)
-        del reference_state
-
-        if self.device_mesh.get_rank() == 0:
-            print("Reference model ready and frozen.")
-
-    def _create_temp_sft_model(self, state_dict):
-        """Create the temporary model q used during Stage 1."""
-        temp_model = self._create_model_clone_from_state(state_dict, requires_grad=True)
-        temp_optimizer = self._build_temp_optimizer(temp_model)
-        return temp_model, temp_optimizer
-
-    def _build_temp_optimizer(self, model):
-        return build_optimizer(model.parameters(), self.config.optim)
-
     def _sample_sequence(self, model, input_ids, attention_mask, max_length=None):
         generation_model = model
-        param_ctx = nullcontext()
-        if isinstance(model, FSDP):
-            param_ctx = FSDP.summon_full_params(model, writeback=False, recurse=False)
-            generation_model = model.module
-        elif hasattr(model, "module"):
-            generation_model = model.module
         generation_model.eval()
 
         if max_length is None:
             max_length = self.config.data.max_length
 
-        with param_ctx, torch.no_grad():
+        with torch.no_grad():
             generated = generation_model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -1013,13 +995,7 @@ class AntiForgettingSFTTrainer(FSDPSFTTrainer):
         return generated
 
     def _get_token_logits(self, model, input_ids, attention_mask, position_ids):
-        if isinstance(model, FSDP):
-            infer_model = model
-        elif hasattr(model, "module"):
-            infer_model = model.module
-        else:
-            infer_model = model
-
+        infer_model = model
         infer_model.eval()
         with torch.no_grad(), torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
             output = infer_model(
@@ -1030,153 +1006,208 @@ class AntiForgettingSFTTrainer(FSDPSFTTrainer):
             )
         return output.logits
 
-    def _construct_soft_labels(self, batch: TensorDict, temp_model, outer_iter: int) -> TensorDict:
-        batch = batch.clone()
-        batch = batch.to(self.device_name)
+    def _construct_soft_labels(self, batch: TensorDict, outer_iter: int) -> TensorDict:
+        batch_soft_labels = batch.clone()
+        batch_soft_labels = batch_soft_labels.to(self.device_name)
 
-        input_ids = batch["input_ids"]
-        attention_mask = batch["attention_mask"]
-        position_ids = batch["position_ids"]
+        input_ids = batch_soft_labels["input_ids"].to(self.device_name)
+        attention_mask = batch_soft_labels["attention_mask"].to(self.device_name)
+        position_ids = batch_soft_labels["position_ids"].to(self.device_name)
+        loss_mask = batch_soft_labels["loss_mask"].to(self.device_name)
 
-        use_gold = torch.rand(1, device=self.device_name).item() < self.soft_label_sample_ratio
-        if use_gold:
-            sequence_ids = input_ids
-        else:
-            sequence_ids = self._sample_sequence(temp_model, input_ids, attention_mask)
-            # Align sampled sequence length with the gold sequence
-            target_length = input_ids.shape[1]
-            if sequence_ids.shape[1] > target_length:
-                sequence_ids = sequence_ids[:, :target_length]
-            elif sequence_ids.shape[1] < target_length:
-                pad_length = target_length - sequence_ids.shape[1]
-                pad_token = self.tokenizer.pad_token_id
-                sequence_ids = F.pad(sequence_ids, (0, pad_length), value=pad_token)
+        use_gold = True
+        sequence_ids = input_ids
 
-        logits_p0 = self._get_token_logits(self.reference_model, sequence_ids, attention_mask, position_ids)
-        logits_q = self._get_token_logits(temp_model, sequence_ids, attention_mask, position_ids)
+        # rank = torch.distributed.get_rank()
+        # if rank == 0:
+        #     use_gold = torch.rand(1, device=self.device_name).item() < self.soft_label_gold_ratio
 
-        log_p0 = F.log_softmax(logits_p0, dim=-1)
-        log_q = F.log_softmax(logits_q, dim=-1)
+        # if use_gold:
+        #     sequence_ids = input_ids
+        # else:
+        #     sequence_ids = self._sample_sequence(self.fsdp_model, input_ids, attention_mask)
+        #     # Align sampled sequence length with the gold sequence
+        #     target_length = input_ids.shape[1]
+        #     if sequence_ids.shape[1] > target_length:
+        #         sequence_ids = sequence_ids[:, :target_length]
+        #     elif sequence_ids.shape[1] < target_length:
+        #         pad_length = target_length - sequence_ids.shape[1]
+        #         pad_token = self.tokenizer.pad_token_id
+        #         sequence_ids = F.pad(sequence_ids, (0, pad_length), value=pad_token)
+
+        logits_reference = self._get_token_logits(self.fsdp_model_reference, sequence_ids, attention_mask, position_ids)
+        logits_sft = self._get_token_logits(self.fsdp_model_sft, sequence_ids, attention_mask, position_ids)
+
+        log_reference = F.log_softmax(logits_reference, dim=-1)
+        log_sft = F.log_softmax(logits_sft, dim=-1)
 
         if self.use_dynamic_alpha:
             alpha = min(self.soft_label_alpha + 0.1 * outer_iter / max(self.n_outer_iterations - 1, 1), 0.9)
         else:
             alpha = self.soft_label_alpha
 
-        log_p_star = (1.0 - alpha) * log_p0 + alpha * log_q
+        log_p_star = (1.0 - alpha) * log_reference + alpha * log_sft
         soft_labels = F.softmax(log_p_star, dim=-1).to(torch.bfloat16)
 
         batch_size = input_ids.shape[0]
-        batch["sequence_ids"] = sequence_ids
-        batch["soft_labels"] = soft_labels
+        batch_soft_labels["sequence_ids"] = sequence_ids
+        batch_soft_labels["soft_labels"] = soft_labels
         use_gold_tensor = torch.full((batch_size,), use_gold, device=self.device_name, dtype=torch.bool)
-        batch["use_gold"] = use_gold_tensor
-        return batch
+        batch_soft_labels["use_gold"] = use_gold_tensor
+        batch_soft_labels["loss_mask"] = loss_mask
+        batch_soft_labels['attention_mask'] = attention_mask
+        batch_soft_labels['position_ids'] = position_ids
 
-    def _compute_soft_label_loss(self, batch: TensorDict) -> torch.Tensor:
-        sequence_ids = batch["sequence_ids"].to(self.device_name)
+        return batch_soft_labels
+    
+    def _compute_soft_label_loss(self, batch: TensorDict, do_backward=True, n_micro_batches=1):
+        use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
+
+        labels = batch['soft_labels'].to(self.device_name)
+        input_ids = batch["sequence_ids"].to(self.device_name)
         attention_mask = batch["attention_mask"].to(self.device_name)
         position_ids = batch["position_ids"].to(self.device_name)
-        soft_labels = batch["soft_labels"].to(self.device_name)
-        loss_mask = batch["loss_mask"][:, 1:].reshape(-1).to(self.device_name)
+        loss_mask = batch.pop("loss_mask")[:, 1:].reshape(-1).to(self.device_name)
+        # loss_mask = batch.pop("loss_mask").reshape(-1).to(self.device_name)
+        # loss_fct = nn.CrossEntropyLoss(reduction="none")
+        loss_fct = nn.KLDivLoss(reduction="none")
 
-        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
-            outputs = self.fsdp_model(
-                input_ids=sequence_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                use_cache=False,
-            )
-            logits = outputs.logits
+        context = self.sharding_manager if use_sp else nullcontext()
+        with context, torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+            if not use_sp:
+                output = self.fsdp_model(
+                    input_ids=input_ids
+                    , attention_mask=attention_mask
+                    , position_ids=position_ids
+                    , use_cache=False
+                )
+                logits = output.logits
+                # print('1 shift_logits.shape:', logits.shape)
+                # print('1 shift_labels.shape:', labels.shape)
 
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_soft_labels = soft_labels[..., 1:, :].contiguous()
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:, :].contiguous()
+                # shift_logits = logits.contiguous()
+                # shift_labels = labels.contiguous()
+                # print('2 shift_logits.shape:', shift_logits.shape)
+                # print('2 shift_labels.shape:', shift_labels.shape)
 
-            shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
-            shift_soft_labels = shift_soft_labels.view(-1, self.model.config.vocab_size).to(shift_logits.dtype)
+                # Flatten the tokens
+                shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
+                shift_labels = shift_labels.view(-1, self.model.config.vocab_size)
+                log_shift_logits = F.log_softmax(shift_logits, dim=-1)
 
-            log_probs = F.log_softmax(shift_logits, dim=-1)
-            loss = F.kl_div(log_probs, shift_soft_labels, reduction="none", log_target=False)
-            loss = loss.sum(dim=-1)
-            loss = loss * loss_mask
+                # print('3 shift_logits.shape', shift_logits.shape)
+                # print('3 shift_labels.shape:', shift_labels.shape)
+                # Enable model parallelism
+                shift_labels = shift_labels.to(shift_logits.device)
+                loss = loss_fct(log_shift_logits, shift_labels)
+                loss = loss.sum(dim=-1)
+                loss = loss * loss_mask.to(loss.device)
 
-        valid_tokens = torch.sum(loss_mask)
+        valid_token_this_rank = torch.sum(loss_mask)
         if self.config.data.balance_dp_token:
-            torch.distributed.all_reduce(valid_tokens)
-            dp_size = self.device_mesh.size(0)
+            torch.distributed.all_reduce(valid_token_this_rank)
+            dp_size = self.ulysses_device_mesh.size("dp") if use_sp else torch.distributed.get_world_size()
         else:
             dp_size = 1
 
-        loss = torch.sum(loss) / (valid_tokens + 1e-8) * dp_size
+        loss = torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
+
+        loss = loss / n_micro_batches  # normalize loss
+
+        if do_backward:
+            loss.backward()
         return loss
 
-    def training_step_stage1(self, batch: TensorDict, temp_model, temp_optimizer):
-        temp_model.train()
-        temp_optimizer.zero_grad()
+    def training_step_for_final_model(self, batch: TensorDict):
+        start_time = time.time()
+        self.fsdp_model.train() # 设置为训练模式
+        self.fsdp_model.zero_grad() # 使用新的优化器清零梯度
+
         micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
         n_micro_batches = len(micro_batches)
-        step_loss = 0.0
+        step_loss = 0
+
         for micro_batch in micro_batches:
-            loss = self._compute_loss_and_backward(
-                batch=micro_batch, do_backward=True, n_micro_batches=n_micro_batches
+            loss = self._compute_soft_label_loss(
+                batch=micro_batch,
+                n_micro_batches=n_micro_batches,
             )
             step_loss += loss.item()
 
         if self.config.model.strategy == "fsdp":
-            temp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
+            grad_norm = self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
         elif self.config.model.strategy == "fsdp2":
-            fsdp2_clip_grad_norm_(temp_model.parameters(), max_norm=self.config.optim.clip_grad)
+            grad_norm = fsdp2_clip_grad_norm_(self.fsdp_model.parameters(), max_norm=self.config.optim.clip_grad)
+        else:
+            raise NotImplementedError(f"not implement {self.config.model.strategy}")
 
-        temp_optimizer.step()
-        return step_loss
+        # 检查梯度是否有效
+        if not torch.isfinite(grad_norm):
+            print(f"WARN: grad_norm for 'fsdp_model' is not finite: {grad_norm}")
+            self.optimizer.zero_grad() # 如果梯度爆炸，就跳过更新
+        else:
+            # 使用新的优化器更新参数
+            self.optimizer.step()
 
-    def training_step_stage3(self, batch: TensorDict):
-        self.fsdp_model.train()
-        self.optimizer.zero_grad()
-
-        loss = self._compute_soft_label_loss(batch)
-        loss.backward()
-
-        if self.config.model.strategy == "fsdp":
-            self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
-        elif self.config.model.strategy == "fsdp2":
-            fsdp2_clip_grad_norm_(self.fsdp_model.parameters(), max_norm=self.config.optim.clip_grad)
-
-        self.optimizer.step()
         self.lr_scheduler.step()
-        return loss.item()
 
-    def fit_anti_forgetting(self):
+        lr = self.lr_scheduler.get_last_lr()[0]
+
+        step_loss = torch.tensor(step_loss).to(self.device_name)
+        end_time = time.time()
+        spend_time_per_step = end_time - start_time
+
+        if is_cuda_available:
+            torch.distributed.all_reduce(step_loss, op=torch.distributed.ReduceOp.AVG)
+        elif is_npu_available:
+            torch.distributed.all_reduce(step_loss)
+            step_loss /= self.device_mesh.size(0)
+
+        return {
+            # "stage": "2. train_final_model",
+            "fsdp_model/train/loss": step_loss.detach().item(),
+            "train_final_model/lr(1e-3)": lr * 1e3,
+            "train_final_model/time(s)": spend_time_per_step,
+        }
+
+    def fit_less_forgetting(self):
         rank = self.device_mesh.get_rank()
 
+        # TODO: add a unified tracking
         if rank == 0:
             tracking = Tracking(
                 project_name=self.config.trainer.project_name,
-                experiment_name=self.config.trainer.experiment_name + "_anti_forgetting",
+                experiment_name=self.config.trainer.experiment_name,
                 default_backend=self.config.trainer.logger,
                 config=OmegaConf.to_container(self.config, resolve=True),
             )
 
-        global_step = self.resume_global_step
+        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs * self.n_outer_iterations
+        if self.config.trainer.total_training_steps is not None:
+            total_training_steps = self.config.trainer.total_training_steps
+        self.total_training_steps = total_training_steps
 
+        log_with_rank(
+            f"Total training steps: {self.total_training_steps},",
+            logger=logger,
+            rank=self.device_mesh.get_rank(),
+            log_only_rank_0=True,
+        )
+
+        global_step = self.resume_global_step  # Start from resumed step
+        train_time = 0 
         for outer_iter in range(self.n_outer_iterations):
+            
+            self.train_sampler.set_epoch(epoch=outer_iter)
+
             if rank == 0:
                 print("\n" + "=" * 60)
                 print(f"Outer iteration {outer_iter + 1}/{self.n_outer_iterations}")
                 print("=" * 60)
-
-            # Save current policy state and offload to CPU to free GPU memory
-            policy_state = get_fsdp_full_state_dict(self.fsdp_model, offload_to_cpu=True, rank0_only=False)
-            offload_fsdp_optimizer(self.optimizer)
-            offload_fsdp_model_to_cpu(self.fsdp_model)
-
-            temp_model, temp_optimizer = self._create_temp_sft_model(policy_state)
-            policy_model = self.fsdp_model
-            self.fsdp_model = temp_model
-            stage1_losses = []
-            self.train_sampler.set_epoch(epoch=outer_iter * 2)
-
-            for step, data in enumerate(
+            
+            for sft_step, data in enumerate(
                 tqdm(
                     self.train_dataloader,
                     desc=f"Stage 1 (outer {outer_iter + 1})",
@@ -1184,24 +1215,16 @@ class AntiForgettingSFTTrainer(FSDPSFTTrainer):
                 )
             ):
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size).to(self.device_name)
-                loss = self.training_step_stage1(data, temp_model, temp_optimizer)
-                stage1_losses.append(loss)
-                global_step += 1
+                metric = self.training_step_for_sft(batch=data, current_outer_iteration=outer_iter)
+                train_time += metric["train_for_sft/time(s)"]
+                if rank == 0:
+                    tracking.log(data=metric, step=global_step)
 
-                if rank == 0 and step % 10 == 0:
-                    tracking.log({"stage1/loss": loss}, step=global_step)
-
-            avg_stage1_loss = sum(stage1_losses) / max(len(stage1_losses), 1)
             if rank == 0:
-                print(f"Stage 1 completed. Avg loss: {avg_stage1_loss:.4f}")
-
-            temp_model.eval()
-            load_fsdp_model_to_gpu(self.reference_model)
-
-            soft_label_batches = []
-            self.train_sampler.set_epoch(epoch=outer_iter * 2 + 1)
-            logged_soft_label = False
-
+                tracking.log(data=metric, step=global_step)
+                print(f"Stage 1 completed.")
+            
+            print(f"Stage 2: Training fsdp_model with less forgetting...") 
             for step, data in enumerate(
                 tqdm(
                     self.train_dataloader,
@@ -1211,91 +1234,45 @@ class AntiForgettingSFTTrainer(FSDPSFTTrainer):
             ):
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size)
                 micro_batches = data.split(self.config.data.micro_batch_size_per_gpu)
-                for micro_batch in micro_batches:
-                    micro_batch = micro_batch.to(self.device_name)
-                    soft_batch = self._construct_soft_labels(micro_batch, temp_model, outer_iter).detach()
-                    soft_batch["soft_labels"] = soft_batch["soft_labels"].float()
-                    cpu_tensors = {
-                        key: value.detach().cpu()
-                        for key, value in soft_batch.items()
-                    }
-                    cpu_batch = TensorDict(cpu_tensors, batch_size=soft_batch.batch_size, device="cpu")
-                    soft_label_batches.append(cpu_batch)
-
-                    if rank == 0 and not logged_soft_label:
-                        print(f"Stage 2 sample uses gold: {soft_batch['use_gold'].item()!s}")
-                        logged_soft_label = True
-
-                    if is_cuda_available:
-                        torch.cuda.empty_cache()
-
-            offload_fsdp_model_to_cpu(self.reference_model)
-            del temp_model, temp_optimizer
-            if is_cuda_available:
-                torch.cuda.empty_cache()
-
-            self.fsdp_model = policy_model
-            load_fsdp_model_to_gpu(self.fsdp_model)
-            self._load_model_state(self.fsdp_model, policy_state)
-            load_fsdp_optimizer(self.optimizer, get_device_id())
-            del policy_state
-
-            if rank == 0:
-                print(f"Stage 2 completed. Batches prepared: {len(soft_label_batches)}")
-
-            stage3_losses = []
-            for step, soft_batch in enumerate(
-                tqdm(
-                    soft_label_batches,
-                    desc=f"Stage 3 (outer {outer_iter + 1})",
-                    disable=rank != 0,
-                )
-            ):
-                soft_batch = soft_batch.to(self.device_name)
-                loss = self.training_step_stage3(soft_batch)
-                stage3_losses.append(loss)
                 global_step += 1
+                for micro_idx, micro_batch in enumerate(micro_batches):
+                    micro_batch = micro_batch.to(self.device_name)
+                    soft_batch = self._construct_soft_labels(micro_batch, outer_iter).detach()
+                    metric = self.training_step_for_final_model(batch=soft_batch)
+                    train_time += metric["train_final_model/time(s)"]
 
-                if rank == 0 and step % 10 == 0:
-                    tracking.log({"stage3/loss": loss}, step=global_step)
+                    is_last_step = global_step >= self.total_training_steps
+                    is_valid_step = global_step % self.config.trainer.test_freq == 0
+                    is_save_step = global_step % self.config.trainer.save_freq == 0
 
-            avg_stage3_loss = sum(stage3_losses) / max(len(stage3_losses), 1)
-            if rank == 0:
-                print(f"Stage 3 completed. Avg loss: {avg_stage3_loss:.4f}")
+                    # early exit or validation step
+                    if is_last_step or (self.config.trainer.test_freq > 0 and is_valid_step):
+                        # Perform validation
+                        val_losses = []
+                        for val_data in self.val_dataloader:
+                            val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).to(
+                                self.device_name
+                            )
+                            val_loss = self.validation_step(val_data)
+                            val_losses.append(val_loss)
+                        if rank == 0:
+                            val_loss = torch.mean(torch.stack(val_losses))
+                            metric = {"val/loss": val_loss.detach().item()}
+                            tracking.log(data=metric, step=global_step)
+                            last_valid_metric = metric
+                        torch.distributed.barrier()
 
-            if rank == 0:
-                print("\nRunning validation...")
+                    if is_last_step or (self.config.trainer.save_freq > 0 and is_save_step):
+                        self.save_checkpoint(step=global_step)
 
-            val_losses = []
-            for val_data in self.val_dataloader:
-                val_data = TensorDict(
-                    val_data, batch_size=self.config.data.micro_batch_size_per_gpu
-                ).to(self.device_name)
-                val_loss = self.validation_step(val_data)
-                val_losses.append(val_loss)
-
-            if rank == 0:
-                val_metric = torch.mean(torch.stack(val_losses))
-                tracking.log(
-                    {
-                        "val/loss": val_metric.item(),
-                        "outer_iteration": outer_iter + 1,
-                        "stage1/avg_loss": avg_stage1_loss,
-                        "stage3/avg_loss": avg_stage3_loss,
-                    },
-                    step=global_step,
-                )
-                print(f"Validation loss: {val_metric.item():.4f}")
-
-            self.save_checkpoint(step=global_step)
-            torch.distributed.barrier()
-
-        if rank == 0:
-            print("\n" + "=" * 60)
-            print("Anti-forgetting training completed")
-            print(f"Total outer iterations: {self.n_outer_iterations}")
-            print(f"Final global step: {global_step}")
-            print("=" * 60)
+                    if is_last_step:
+                        if rank == 0:
+                            print(f"Total time for train steps: {train_time:.2f}s")
+                            print(f"Final validation metrics: {last_valid_metric}")
+                        return
+                    
+                if rank == 0:
+                    tracking.log(data=metric, step=global_step)
 
 
 def run_sft(config):
@@ -1321,13 +1298,7 @@ def run_sft(config):
         config.data.val_files, config.data, tokenizer, max_samples=config.data.get("val_max_samples", -1)
     )
 
-    anti_forgetting_flag = bool(getattr(config.trainer, "anti_forgetting", False))
-    anti_cfg = getattr(config, "anti_forgetting", None)
-    if anti_cfg is not None and getattr(anti_cfg, "enable", False):
-        anti_forgetting_flag = True
-
-    trainer_cls = AntiForgettingSFTTrainer if anti_forgetting_flag else FSDPSFTTrainer
-    trainer = trainer_cls(
+    trainer = FSDPSFTTrainer(
         config=config,
         device_mesh=device_mesh,
         ulysses_device_mesh=ulysses_device_mesh,
@@ -1336,9 +1307,11 @@ def run_sft(config):
         val_dataset=val_dataset,
     )
 
+    anti_forgetting_flag = bool(getattr(config.trainer, "anti_forgetting", False))
+    print(f"===============\nanti_forgetting_flag: {anti_forgetting_flag}\n===============")
     if anti_forgetting_flag:
-        trainer.fit_anti_forgetting()
-    else:
+        trainer.fit_less_forgetting()
+    else:   
         trainer.fit()
 
     destroy_global_process_group()
