@@ -477,13 +477,20 @@ class FSDPSFTTrainer:
         step_loss = 0
 
         for micro_batch in micro_batches:
-        # micro_batch = micro_batches[current_outer_iteration]
             loss = self._compute_loss_and_backward(
                 batch=micro_batch,
                 n_micro_batches=n_micro_batches,
                 model=self.fsdp_model_sft
             )
             step_loss += loss.item()
+
+        # micro_batch = micro_batches[current_outer_iteration]
+        # loss = self._compute_loss_and_backward(
+        #         batch=micro_batch,
+        #         n_micro_batches=n_micro_batches,
+        #         model=self.fsdp_model_sft
+        #     )
+        # step_loss += loss.item()
 
         if self.config.model.strategy == "fsdp":
             grad_norm = self.fsdp_model_sft.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
@@ -776,15 +783,7 @@ class FSDPSFTTrainer:
             lr_scheduler=self.lr_scheduler,
             processing_class=self.tokenizer,
             checkpoint_config=checkpoint_config_dict,
-        )   
-
-        self.checkpoint_manager_reference = FSDPCheckpointManager(
-            model=self.fsdp_model_reference,
-            optimizer=None,
-            lr_scheduler=None,
-            processing_class=self.tokenizer,
-            checkpoint_config=checkpoint_config_dict,
-        )
+        )  
 
     def load_checkpoint(self):
         # Determine resume path based on configuration
@@ -1067,8 +1066,8 @@ class FSDPSFTTrainer:
         input_ids = batch["sequence_ids"].to(self.device_name)
         attention_mask = batch["attention_mask"].to(self.device_name)
         position_ids = batch["position_ids"].to(self.device_name)
-        loss_mask = batch.pop("loss_mask")[:, 1:].reshape(-1).to(self.device_name)
-        # loss_mask = batch.pop("loss_mask").reshape(-1).to(self.device_name)
+        # loss_mask = batch.pop("loss_mask")[:, 1:].reshape(-1).to(self.device_name)
+        loss_mask = batch.pop("loss_mask").reshape(-1).to(self.device_name)
         # loss_fct = nn.CrossEntropyLoss(reduction="none")
         loss_fct = nn.KLDivLoss(reduction="none")
 
@@ -1085,10 +1084,10 @@ class FSDPSFTTrainer:
                 # print('1 shift_logits.shape:', logits.shape)
                 # print('1 shift_labels.shape:', labels.shape)
 
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:, :].contiguous()
-                # shift_logits = logits.contiguous()
-                # shift_labels = labels.contiguous()
+                # shift_logits = logits[..., :-1, :].contiguous()
+                # shift_labels = labels[..., 1:, :].contiguous()
+                shift_logits = logits.contiguous()
+                shift_labels = labels.contiguous()
                 # print('2 shift_logits.shape:', shift_logits.shape)
                 # print('2 shift_labels.shape:', shift_labels.shape)
 
@@ -1125,16 +1124,22 @@ class FSDPSFTTrainer:
         self.fsdp_model.train() # 设置为训练模式
         self.fsdp_model.zero_grad() # 使用新的优化器清零梯度
 
-        micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
-        n_micro_batches = len(micro_batches)
+        # micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
+        # n_micro_batches = len(micro_batches)
         step_loss = 0
 
-        for micro_batch in micro_batches:
-            loss = self._compute_soft_label_loss(
-                batch=micro_batch,
-                n_micro_batches=n_micro_batches,
+        # for micro_batch in micro_batches:
+        #     loss = self._compute_soft_label_loss(
+        #         batch=micro_batch,
+        #         n_micro_batches=n_micro_batches,
+        #     )
+        #     step_loss += loss.item()
+
+        loss = self._compute_soft_label_loss(
+                batch=batch,
+                n_micro_batches=len(batch),
             )
-            step_loss += loss.item()
+        step_loss += loss.item()
 
         if self.config.model.strategy == "fsdp":
             grad_norm = self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
@@ -1206,7 +1211,12 @@ class FSDPSFTTrainer:
                 print("\n" + "=" * 60)
                 print(f"Outer iteration {outer_iter + 1}/{self.n_outer_iterations}")
                 print("=" * 60)
+
             
+            # ================== Stage 1: Create and train sft model ==================
+            if rank == 0:
+                print(f"\n[Stage 1] Training sft model on original data...")
+
             for sft_step, data in enumerate(
                 tqdm(
                     self.train_dataloader,
@@ -1216,15 +1226,23 @@ class FSDPSFTTrainer:
             ):
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size).to(self.device_name)
                 metric = self.training_step_for_sft(batch=data, current_outer_iteration=outer_iter)
+                
+                global_step += 1
+
                 train_time += metric["train_for_sft/time(s)"]
-                if rank == 0:
+                if rank == 0 and sft_step % 10 == 0:
                     tracking.log(data=metric, step=global_step)
 
             if rank == 0:
                 tracking.log(data=metric, step=global_step)
                 print(f"Stage 1 completed.")
             
-            print(f"Stage 2: Training fsdp_model with less forgetting...") 
+            # ================== Stage 2: Construct soft labels ==================
+            if rank == 0:
+                print(f"[Stage 2] Training fsdp_model with less forgetting...")
+
+            # soft_label_dataset = []
+
             for step, data in enumerate(
                 tqdm(
                     self.train_dataloader,
@@ -1234,45 +1252,89 @@ class FSDPSFTTrainer:
             ):
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size)
                 micro_batches = data.split(self.config.data.micro_batch_size_per_gpu)
-                global_step += 1
-                for micro_idx, micro_batch in enumerate(micro_batches):
-                    micro_batch = micro_batch.to(self.device_name)
-                    soft_batch = self._construct_soft_labels(micro_batch, outer_iter).detach()
+
+                # print(f"[Stage 2] Processing {len(micro_batches)} micro-batches.")
+
+                metric = None
+                for micro_batch in micro_batches:
+                    # print(len(micro_batch))
+                    soft_batch = self._construct_soft_labels(micro_batch, outer_iter)
                     metric = self.training_step_for_final_model(batch=soft_batch)
                     train_time += metric["train_final_model/time(s)"]
 
-                    is_last_step = global_step >= self.total_training_steps
-                    is_valid_step = global_step % self.config.trainer.test_freq == 0
-                    is_save_step = global_step % self.config.trainer.save_freq == 0
+                # soft_batch = self._construct_soft_labels(data, outer_iter)
 
-                    # early exit or validation step
-                    if is_last_step or (self.config.trainer.test_freq > 0 and is_valid_step):
-                        # Perform validation
-                        val_losses = []
-                        for val_data in self.val_dataloader:
-                            val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).to(
-                                self.device_name
-                            )
-                            val_loss = self.validation_step(val_data)
-                            val_losses.append(val_loss)
-                        if rank == 0:
-                            val_loss = torch.mean(torch.stack(val_losses))
-                            metric = {"val/loss": val_loss.detach().item()}
-                            tracking.log(data=metric, step=global_step)
-                            last_valid_metric = metric
-                        torch.distributed.barrier()
-
-                    if is_last_step or (self.config.trainer.save_freq > 0 and is_save_step):
-                        self.save_checkpoint(step=global_step)
-
-                    if is_last_step:
-                        if rank == 0:
-                            print(f"Total time for train steps: {train_time:.2f}s")
-                            print(f"Final validation metrics: {last_valid_metric}")
-                        return
-                    
+                # soft_label_dataset.append(soft_batch.cpu())
                 if rank == 0:
-                    tracking.log(data=metric, step=global_step)
+                    tracking.log(metric, step=global_step)
+
+                global_step += 1
+
+                is_save_step = global_step % self.config.trainer.save_freq == 0
+
+                if self.config.trainer.save_freq > 0 and is_save_step:
+                    self.save_checkpoint(step=global_step)
+
+            if rank == 0:
+                # print(f"[Stage 2] completed. Constructed {len(soft_label_dataset)} soft-labeled batches.")
+                print(f"[Stage 2] completed.")
+
+            # torch.cuda.empty_cache()
+            # # ================== Stage 3: Train p on soft labels ==================
+            # if rank == 0:
+            #     print(f"\n[Stage 3] Training policy model p on soft labels...")
+
+            # for step, soft_batch in enumerate(tqdm(
+            #     soft_label_dataset,
+            #     desc=f"Stage 3 (Outer {outer_iter+1})",
+            #     disable=rank != 0
+            # )):
+            #     soft_batch = soft_batch.to(self.device_name)
+            #     metric = self.training_step_for_final_model(batch=soft_batch)
+            #     train_time += metric["train_final_model/time(s)"]
+
+            #     global_step += 1
+
+            #     if rank == 0:
+            #         tracking.log(metric, step=global_step)
+
+            #     is_save_step = global_step % self.config.trainer.save_freq == 0
+
+            #     if self.config.trainer.save_freq > 0 and is_save_step:
+            #         self.save_checkpoint(step=global_step)
+
+            # if rank == 0:
+            #     print(f"Stage 3 completed. ")
+
+                # is_last_step = global_step >= self.total_training_steps
+                # is_valid_step = global_step % self.config.trainer.test_freq == 0
+                # is_save_step = global_step % self.config.trainer.save_freq == 0
+
+                # # early exit or validation step
+                # if is_last_step or (self.config.trainer.test_freq > 0 and is_valid_step):
+                #     # Perform validation
+                #     val_losses = []
+                #     for val_data in self.val_dataloader:
+                #         val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).to(
+                #             self.device_name
+                #         )
+                #         val_loss = self.validation_step(val_data)
+                #         val_losses.append(val_loss)
+                #     if rank == 0:
+                #         val_loss = torch.mean(torch.stack(val_losses))
+                #         metric = {"val/loss": val_loss.detach().item()}
+                #         tracking.log(data=metric, step=global_step)
+                #         last_valid_metric = metric
+                #     torch.distributed.barrier()
+
+                # if is_last_step or (self.config.trainer.save_freq > 0 and is_save_step):
+                #     self.save_checkpoint(step=global_step)
+
+                # if is_last_step:
+                #     if rank == 0:
+                #         print(f"Total time for train steps: {train_time:.2f}s")
+                #         print(f"Final validation metrics: {last_valid_metric}")
+                #     return
 
 
 def run_sft(config):
@@ -1308,7 +1370,8 @@ def run_sft(config):
     )
 
     anti_forgetting_flag = bool(getattr(config.trainer, "anti_forgetting", False))
-    print(f"===============\nanti_forgetting_flag: {anti_forgetting_flag}\n===============")
+    if rank == 0:
+        print(f"===============\nanti_forgetting_flag: {anti_forgetting_flag}\n===============")
     if anti_forgetting_flag:
         trainer.fit_less_forgetting()
     else:   
