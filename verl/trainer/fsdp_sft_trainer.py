@@ -703,48 +703,136 @@ class FSDPSFTTrainer:
 
         return latest_checkpoint
 
+    # def _sample_responses(self, prompts, input_ids, attention_mask, n_samples=4, temperature=1.0):
+    #     """
+    #     从当前策略模型中采样多个响应
+        
+    #     Args:
+    #         prompts: List of prompt strings
+    #         input_ids: Prompt token ids [batch_size, prompt_length]
+    #         attention_mask: Attention mask for prompts
+    #         n_samples: Number of responses to sample per prompt
+    #         temperature: Sampling temperature
+            
+    #     Returns:
+    #         sampled_responses: List of lists [[response1_ids, response2_ids, ...], ...]
+    #                           Shape: [batch_size][n_samples][response_length]
+    #     """
+    #     self.fsdp_model.eval()
+    #     batch_size = input_ids.shape[0]
+    #     sampled_responses = []
+
+    #     if self.device_mesh.get_rank() == 0:
+    #         print(f"_sample_responses\nbatch_size: {batch_size}")
+    #         print(f"Sampling {n_samples} responses per prompt with temperature {temperature}")
+        
+    #     with torch.no_grad():
+    #         for i in tqdm(range(batch_size)):
+    #             prompt_ids = input_ids[i:i+1]  # [1, prompt_length]
+    #             prompt_mask = attention_mask[i:i+1]
+                
+    #             batch_responses = []
+    #             for _ in tqdm(range(n_samples)):
+    #                 # Generate response using model.generate()
+    #                 # Note: Adjust generation config based on your needs
+    #                 output_ids = self.fsdp_model.generate(
+    #                     input_ids=prompt_ids,
+    #                     attention_mask=prompt_mask,
+    #                     max_new_tokens=self.config.data.max_length - prompt_ids.shape[1],
+    #                     temperature=temperature,
+    #                     do_sample=True,
+    #                     pad_token_id=self.tokenizer.pad_token_id,
+    #                     eos_token_id=self.tokenizer.eos_token_id,
+    #                 )
+    #                 # Remove prompt part to get only the response
+    #                 response_ids = output_ids[0, prompt_ids.shape[1]:]
+    #                 if self.device_mesh.get_rank() == 0:
+    #                     prompt_tmp = self.tokenizer.decode(prompt_ids[0], skip_special_tokens=True)
+    #                     response_tmp = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+    #                     print(f"Prompt: {prompt_tmp}")
+    #                     print(f"Response: {response_tmp}")
+    #                 batch_responses.append(response_ids)
+                
+    #             sampled_responses.append(batch_responses)
+        
+    #     self.fsdp_model.train()
+    #     return sampled_responses
+
     def _sample_responses(self, prompts, input_ids, attention_mask, n_samples=4, temperature=1.0):
         """
-        从当前策略模型中采样多个响应
-        
+        Efficiently samples multiple responses from the policy model in a single batch.
+
         Args:
-            prompts: List of prompt strings
-            input_ids: Prompt token ids [batch_size, prompt_length]
-            attention_mask: Attention mask for prompts
-            n_samples: Number of responses to sample per prompt
-            temperature: Sampling temperature
-            
+            prompts: List of prompt strings (currently unused, but kept for API consistency).
+            input_ids: Prompt token ids [batch_size, prompt_length].
+            attention_mask: Attention mask for prompts [batch_size, prompt_length].
+            n_samples: Number of responses to sample per prompt.
+            temperature: Sampling temperature.
+
         Returns:
-            sampled_responses: List of lists [[response1_ids, response2_ids, ...], ...]
-                              Shape: [batch_size][n_samples][response_length]
+            sampled_responses: A nested list where each inner list contains `n_samples` response tensors.
+                            Shape: [batch_size][n_samples] -> List[List[torch.Tensor]].
         """
         self.fsdp_model.eval()
-        batch_size = input_ids.shape[0]
-        sampled_responses = []
+        batch_size, prompt_length = input_ids.shape
         
+        # 1. Expand the batch for batched generation
+        # Instead of looping, we repeat each prompt n_samples times to create a single large batch.
+        # Shape changes:
+        # input_ids: [batch_size, prompt_length] -> [batch_size * n_samples, prompt_length]
+        # attention_mask: [batch_size, prompt_length] -> [batch_size * n_samples, prompt_length]
+        expanded_input_ids = input_ids.repeat_interleave(n_samples, dim=0)
+        expanded_attention_mask = attention_mask.repeat_interleave(n_samples, dim=0)
+
+        # if self.device_mesh.get_rank() == 0:
+        #     print(f"Starting batched generation for {batch_size} prompts with {n_samples} samples each.")
+        #     print(f"Original input shape: {input_ids.shape}")
+        #     print(f"Expanded input shape for generation: {expanded_input_ids.shape}")
+
         with torch.no_grad():
-            for i in range(batch_size):
-                prompt_ids = input_ids[i:i+1]  # [1, prompt_length]
-                prompt_mask = attention_mask[i:i+1]
-                
-                batch_responses = []
-                for _ in range(n_samples):
-                    # Generate response using model.generate()
-                    # Note: Adjust generation config based on your needs
-                    output_ids = self.fsdp_model.generate(
-                        input_ids=prompt_ids,
-                        attention_mask=prompt_mask,
-                        max_new_tokens=self.config.data.max_length - prompt_ids.shape[1],
-                        temperature=temperature,
-                        do_sample=True,
-                        pad_token_id=self.tokenizer.pad_token_id,
-                        eos_token_id=self.tokenizer.eos_token_id,
-                    )
-                    # Remove prompt part to get only the response
-                    response_ids = output_ids[0, prompt_ids.shape[1]:]
-                    batch_responses.append(response_ids)
-                
-                sampled_responses.append(batch_responses)
+            # 2. Perform a single, efficient, batched generation call
+            # The model will generate a response for each of the (batch_size * n_samples) inputs in parallel.
+            generated_ids = self.fsdp_model.generate(
+                input_ids=expanded_input_ids,
+                attention_mask=expanded_attention_mask,
+                max_new_tokens=self.config.data.max_length - prompt_length,
+                temperature=temperature,
+                do_sample=True,
+                use_cache=True,
+                output_scores=False,  # 如果不需分数可关闭
+                synced_gpus=True,  # 在FSDP中同步GPU
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+
+        # if self.device_mesh.get_rank() == 0:
+        #     print(f"Completed batched generation. Generated shape: {generated_ids.shape}")
+
+        # 3. Extract and reshape the responses
+        # The output `generated_ids` contains both the prompt and the response.
+        # We slice to get only the newly generated tokens.
+        # Shape: [batch_size * n_samples, response_length]
+        responses_flat = generated_ids[:, prompt_length:]
+
+        # Reshape the flat list of responses back into the desired nested structure.
+        # [response1_prompt1, response2_prompt1, ..., responseN_promptM] -> [[resp1_p1, resp2_p1], [resp1_p2, ...]]
+        sampled_responses = []
+        for i in range(batch_size):
+            start_idx = i * n_samples
+            end_idx = start_idx + n_samples
+            # Slicing the tensor creates a view, which is efficient.
+            # We then convert this slice into a list of individual tensors.
+            prompt_responses = [responses_flat[j] for j in range(start_idx, end_idx)]
+            sampled_responses.append(prompt_responses)
+
+        # Optional: Debug print for one sample on rank 0
+        # if self.device_mesh.get_rank() == 0 and len(sampled_responses) > 0:
+        #     prompt_tmp = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+        #     response_tmp = self.tokenizer.decode(sampled_responses[0][0], skip_special_tokens=True)
+        #     print("--- Example of Batched Generation ---")
+        #     print(f"Prompt (Sample 0): {prompt_tmp}")
+        #     print(f"Response (Sample 0, Response 0): {response_tmp}")
+        #     print("------------------------------------")
         
         self.fsdp_model.train()
         return sampled_responses
@@ -858,6 +946,10 @@ class FSDPSFTTrainer:
             loser_responses: 质量较差的响应
             valid_indices: 有效样本的索引
         """
+
+        # if self.device_mesh.get_rank() == 0:
+        #     print(f"batch:{len(batch)}")
+
         input_ids = batch["input_ids"].to(self.device_name)
         attention_mask = batch["attention_mask"].to(self.device_name)
         
@@ -884,9 +976,16 @@ class FSDPSFTTrainer:
             else:
                 # If no loss mask, use entire sequence as prompt
                 prompt_end = input_ids.shape[1]
+
+            if self.device_mesh.get_rank() == 0:
+                prompt_tmp = self.tokenizer.decode(input_ids[i, :prompt_end], skip_special_tokens=True)
+                # print(f"Sample {i} : {prompt_tmp}")
             
             prompts_ids.append(input_ids[i, :prompt_end])
             prompts_masks.append(attention_mask[i, :prompt_end])
+
+        # if self.device_mesh.get_rank() == 0:
+        #     print(f"Number of prompts extracted: {len(prompts_ids)}")
         
         # Pad prompts to same length for batching
         max_prompt_len = max(len(p) for p in prompts_ids)
@@ -1078,6 +1177,8 @@ class FSDPSFTTrainer:
         """
         SimPO训练步骤
         """
+        rank = self.device_mesh.get_rank()
+        
         start_time = time.time()
         
         self.optimizer.zero_grad()
@@ -1088,7 +1189,7 @@ class FSDPSFTTrainer:
         min_margin = self.config.simpo.get("min_margin", None)
         beta = self.config.simpo.get("beta", None)
         gamma = self.config.simpo.get("gamma", None)
-        
+
         # Generate preference pairs
         result = self._generate_preference_pairs(
             batch=batch,
@@ -1096,6 +1197,9 @@ class FSDPSFTTrainer:
             temperature=temperature,
             min_margin=min_margin
         )
+
+        if rank == 0:
+            print(f"Generate preference pairs finished...")
         
         valid_prompts_ids, winner_full_ids, loser_full_ids, winner_responses, loser_responses, valid_indices = result
         
