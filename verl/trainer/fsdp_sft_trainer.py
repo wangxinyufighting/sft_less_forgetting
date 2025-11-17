@@ -23,10 +23,6 @@ import os
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
-import warnings
-
-warnings.filterwarnings('ignore')
-
 import logging
 import re
 import time
@@ -79,7 +75,6 @@ from verl.utils.ulysses import (
 )
 from verl.workers.config.optimizer import build_optimizer
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
-import torch.nn.functional as F
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_SFT_LOGGING_LEVEL", "WARN"))
@@ -138,31 +133,6 @@ class FSDPSFTTrainer:
         if self.device_mesh.get_rank() == 0:
             print(self.config)
         self.device_name = self.config.trainer.device
-
-        self.n_outer_iterations = getattr(self.config.trainer, "n_outer_iterations", None)
-        if self.n_outer_iterations is None:
-            raise ValueError("anti_forgetting.n_outer (or trainer.n_outer_iterations) must be provided")
-        self.n_outer_iterations = int(self.n_outer_iterations)
-
-        gold_ratio = getattr(self.config.trainer, "gold_sample_ratio", None)
-        if gold_ratio is None:
-            raise ValueError("trainer.gold_sample_ratio must be provided")
-        self.soft_label_gold_ratio = float(min(max(gold_ratio, 0.0), 1.0))
-
-        self.use_dynamic_alpha = getattr(self.config.trainer, "use_dynamic_alpha", None)
-        if self.use_dynamic_alpha is None:
-            raise ValueError("trainer.use_dynamic_alpha must be provided")
-        self.use_dynamic_alpha = bool(self.use_dynamic_alpha)
-
-        self.soft_label_alpha = getattr(self.config.trainer, "soft_label_alpha", None)
-        if self.soft_label_alpha is None:
-            raise ValueError("trainer.soft_label_alpha must be provided")
-        self.soft_label_alpha = float(self.soft_label_alpha)
-
-        self.anti_forgetting = getattr(self.config.trainer, "anti_forgetting", None)
-        if self.anti_forgetting is None:
-            raise ValueError("trainer.anti_forgetting must be provided")
-        self.anti_forgetting = bool(self.anti_forgetting)
 
     def _normalize_config_bsz(self):
         dp_size = self.device_mesh.size(0) if not self.ulysses_device_mesh else self.ulysses_device_mesh.size(0)
@@ -268,36 +238,16 @@ class FSDPSFTTrainer:
                 trust_remote_code=trust_remote_code,
             )
 
-            self.model_for_sft = AutoModelForCausalLM.from_pretrained(
-                local_model_path, # 或者从另一个路径加载
-                config=config,
-                torch_dtype=torch_dtype,
-                attn_implementation="flash_attention_2",
-                trust_remote_code=trust_remote_code,
-            )
-
-            self.model_for_reference = AutoModelForCausalLM.from_pretrained(
-                local_model_path, # 或者从另一个路径加载
-                config=config,
-                torch_dtype=torch_dtype,
-                attn_implementation="flash_attention_2",
-                trust_remote_code=trust_remote_code,
-            ) 
-
             if self.use_remove_padding or self.config.ulysses_sequence_parallel_size > 1:
                 from verl.models.transformers.monkey_patch import apply_monkey_patch
 
                 apply_monkey_patch(model=self.model, ulysses_sp_size=self.config.ulysses_sequence_parallel_size)
-                apply_monkey_patch(model=self.model_for_sft, ulysses_sp_size=self.config.ulysses_sequence_parallel_size)
-                apply_monkey_patch(model=self.model_for_reference, ulysses_sp_size=self.config.ulysses_sequence_parallel_size)
 
             # Apply Liger kernel if use_liger is enabled
             if self.config.model.get("use_liger", False):
                 from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
 
                 _apply_liger_kernel_to_instance(model=self.model)
-                _apply_liger_kernel_to_instance(model=self.model_for_sft)
-                _apply_liger_kernel_to_instance(model=self.model_for_reference)
 
             if self.lora:
                 self.model.enable_input_require_grads()
@@ -329,7 +279,6 @@ class FSDPSFTTrainer:
 
         if self.config.model.enable_gradient_checkpointing:
             self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-            self.model_for_sft.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
         log_gpu_memory_usage("After model allocation", logger=logger)
 
@@ -366,33 +315,6 @@ class FSDPSFTTrainer:
                 device_mesh=self.device_mesh,
                 forward_prefetch=False,
             )
-            self.fsdp_model_sft = FSDP(
-                self.model_for_sft,
-                cpu_offload=cpu_offload,
-                param_init_fn=init_fn,
-                use_orig_params=False,
-                auto_wrap_policy=auto_wrap_policy,
-                device_id=get_device_id(),
-                sharding_strategy=ShardingStrategy.FULL_SHARD,
-                mixed_precision=mixed_precision,
-                sync_module_states=True,
-                device_mesh=self.device_mesh,
-                forward_prefetch=False,
-            )
-            self.fsdp_model_reference = FSDP(
-                self.model_for_reference,
-                cpu_offload=cpu_offload,
-                param_init_fn=init_fn,
-                use_orig_params=False,
-                auto_wrap_policy=auto_wrap_policy,
-                device_id=get_device_id(),
-                sharding_strategy=ShardingStrategy.FULL_SHARD,
-                mixed_precision=mixed_precision,
-                sync_module_states=True,
-                device_mesh=self.device_mesh,
-                forward_prefetch=False,
-            )
-
         elif fsdp_strategy == "fsdp2":
             assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
             mp_policy = MixedPrecisionPolicy(
@@ -409,25 +331,12 @@ class FSDPSFTTrainer:
             apply_fsdp2(self.model, fsdp_kwargs, self.config.model.fsdp_config)
             fsdp2_load_full_state_dict(self.model, full_state, self.device_mesh, cpu_offload)
             self.fsdp_model = self.model
-
-            apply_fsdp2(self.model_for_sft, fsdp_kwargs, self.config.model.fsdp_config)
-            fsdp2_load_full_state_dict(self.model_for_sft, full_state, self.device_mesh, cpu_offload)
-            self.fsdp_model_sft = self.model_for_sft
-
-            apply_fsdp2(self.model_for_reference, fsdp_kwargs, self.config.model.fsdp_config)
-            fsdp2_load_full_state_dict(self.model_for_reference, full_state, self.device_mesh, cpu_offload)
-            self.fsdp_model_reference = self.model_for_reference
-
-            # frozen
-            self.fsdp_model_reference.eval()
-            self.fsdp_model_reference.requires_grad_(False)
         else:
             raise NotImplementedError(f"not implement {fsdp_strategy}")
 
         log_gpu_memory_usage("After FSDP wrapping", logger=logger)
 
         self.optimizer = build_optimizer(self.fsdp_model.parameters(), self.config.optim)
-        self.optimizer_for_sft = build_optimizer(self.fsdp_model_sft.parameters(), self.config.optim)
 
         log_gpu_memory_usage("After initialize optimizer", logger=logger)
 
@@ -446,98 +355,16 @@ class FSDPSFTTrainer:
             self.lr_scheduler = get_cosine_schedule_with_warmup(
                 optimizer=self.optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps
             )
-            self.lr_scheduler_for_sft = get_cosine_schedule_with_warmup(
-                optimizer=self.optimizer_for_sft, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps
-            )
         elif self.config.optim.lr_scheduler == "wsd":
             self.lr_scheduler = get_wsd_schedule_with_warmup(
                 optimizer=self.optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps
             )
-            self.lr_scheduler_for_sft = get_wsd_schedule_with_warmup(
-                optimizer=self.optimizer_for_sft, num_warmup_steps=num_warmup_steps, num_training_steps=self.total_steps
-            )
         else:
             raise ValueError(f"Unknown lr scheduler: {self.config.optim.lr_scheduler}")
 
-    def training_step_for_sft(self, batch: TensorDict, current_outer_iteration: int):
-        """
-        一个专门用于训练和更新 self.fsdp_model 的函数
-        """
-        start_time = time.time()
-        self.fsdp_model_sft.train() # 设置为训练模式
-
-        log_gpu_memory_usage("Before optimizer zero_grad", logger=logger)
-
-        self.optimizer_for_sft.zero_grad() # 使用新的优化器清零梯度
-
-        log_gpu_memory_usage("After optimizer zero_grad", logger=logger)
-
-        micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
-        n_micro_batches = len(micro_batches)
-        step_loss = 0
-
-        for micro_batch in micro_batches:
-            loss = self._compute_loss_and_backward(
-                batch=micro_batch,
-                n_micro_batches=n_micro_batches,
-                model=self.fsdp_model_sft
-            )
-            step_loss += loss.item()
-
-        # micro_batch = micro_batches[current_outer_iteration]
-        # loss = self._compute_loss_and_backward(
-        #         batch=micro_batch,
-        #         n_micro_batches=n_micro_batches,
-        #         model=self.fsdp_model_sft
-        #     )
-        # step_loss += loss.item()
-
-        if self.config.model.strategy == "fsdp":
-            grad_norm = self.fsdp_model_sft.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
-        elif self.config.model.strategy == "fsdp2":
-            grad_norm = fsdp2_clip_grad_norm_(self.fsdp_model_sft.parameters(), max_norm=self.config.optim.clip_grad)
-        else:
-            raise NotImplementedError(f"not implement {self.config.model.strategy}")
-
-        log_gpu_memory_usage("Before optimizer step", logger=logger)
-
-        # 检查梯度是否有效
-        if not torch.isfinite(grad_norm):
-            print(f"WARN: grad_norm for 'fsdp_model_sft' is not finite: {grad_norm}")
-            self.optimizer_for_sft.zero_grad() # 如果梯度爆炸，就跳过更新
-        else:
-            # 使用新的优化器更新参数
-            self.optimizer_for_sft.step()
-
-        log_gpu_memory_usage("After optimizer step", logger=logger)
-
-        self.lr_scheduler_for_sft.step()
-
-        lr = self.lr_scheduler_for_sft.get_last_lr()[0]
-
-        log_gpu_memory_usage("After offload weights", logger=logger)
-
-        step_loss = torch.tensor(step_loss).to(self.device_name)
-        end_time = time.time()
-        spend_time_per_step = end_time - start_time
-
-        if is_cuda_available:
-            torch.distributed.all_reduce(step_loss, op=torch.distributed.ReduceOp.AVG)
-        elif is_npu_available:
-            torch.distributed.all_reduce(step_loss)
-            step_loss /= self.device_mesh.size(0)
-
-        return {
-            "fsdp_model_sft/train/loss": step_loss.detach().item(),
-            "train_for_sft/lr(1e-3)": lr * 1e3,
-            "train_for_sft/time(s)": spend_time_per_step,
-        }
-
-    def _compute_loss_and_backward(self, batch, do_backward=True, n_micro_batches=1, model=None):
+    def _compute_loss_and_backward(self, batch, do_backward=True, n_micro_batches=1):
         """Compute loss with optional sequence parallelism and remove padding features"""
         use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
-
-        model = model if model is not None else self.fsdp_model
 
         # Move inputs to GPU and prepare loss mask
         input_ids = batch["input_ids"].to(self.device_name)
@@ -552,7 +379,7 @@ class FSDPSFTTrainer:
             if not use_sp:
                 # Standard forward pass without sequence parallel
                 labels = input_ids[:, 1:].contiguous()
-                output = model(
+                output = self.fsdp_model(
                     input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, use_cache=False
                 )
                 logits = output.logits
@@ -597,7 +424,7 @@ class FSDPSFTTrainer:
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
 
                 # Forward pass
-                output = model(
+                output = self.fsdp_model(
                     input_ids=input_ids_rmpad_sliced,
                     attention_mask=None,  # Not needed with flash attention varlen
                     position_ids=position_ids_rmpad_padded,
@@ -777,14 +604,6 @@ class FSDPSFTTrainer:
             checkpoint_config=checkpoint_config_dict,
         )
 
-        self.checkpoint_manager_for_sft = FSDPCheckpointManager(
-            model=self.fsdp_model_sft,
-            optimizer=self.optimizer_for_sft,
-            lr_scheduler=self.lr_scheduler,
-            processing_class=self.tokenizer,
-            checkpoint_config=checkpoint_config_dict,
-        )  
-
     def load_checkpoint(self):
         # Determine resume path based on configuration
         checkpoint_path = self._determine_resume_path()
@@ -884,10 +703,477 @@ class FSDPSFTTrainer:
 
         return latest_checkpoint
 
+    def _sample_responses(self, prompts, input_ids, attention_mask, n_samples=4, temperature=1.0):
+        """
+        从当前策略模型中采样多个响应
+        
+        Args:
+            prompts: List of prompt strings
+            input_ids: Prompt token ids [batch_size, prompt_length]
+            attention_mask: Attention mask for prompts
+            n_samples: Number of responses to sample per prompt
+            temperature: Sampling temperature
+            
+        Returns:
+            sampled_responses: List of lists [[response1_ids, response2_ids, ...], ...]
+                              Shape: [batch_size][n_samples][response_length]
+        """
+        self.fsdp_model.eval()
+        batch_size = input_ids.shape[0]
+        sampled_responses = []
+        
+        with torch.no_grad():
+            for i in range(batch_size):
+                prompt_ids = input_ids[i:i+1]  # [1, prompt_length]
+                prompt_mask = attention_mask[i:i+1]
+                
+                batch_responses = []
+                for _ in range(n_samples):
+                    # Generate response using model.generate()
+                    # Note: Adjust generation config based on your needs
+                    output_ids = self.fsdp_model.generate(
+                        input_ids=prompt_ids,
+                        attention_mask=prompt_mask,
+                        max_new_tokens=self.config.data.max_length - prompt_ids.shape[1],
+                        temperature=temperature,
+                        do_sample=True,
+                        pad_token_id=self.tokenizer.pad_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                    )
+                    # Remove prompt part to get only the response
+                    response_ids = output_ids[0, prompt_ids.shape[1]:]
+                    batch_responses.append(response_ids)
+                
+                sampled_responses.append(batch_responses)
+        
+        self.fsdp_model.train()
+        return sampled_responses
+    
+    def _compute_nll_scores(self, prompts_ids, responses_list, attention_masks):
+        """
+        批量计算所有采样响应的负对数似然(NLL)分数
+        
+        Args:
+            prompts_ids: [batch_size, prompt_length]
+            responses_list: List of lists of response tensors [batch_size][n_samples]
+            attention_masks: [batch_size, prompt_length]
+            
+        Returns:
+            nll_scores: [batch_size, n_samples] - NLL scores for each response
+        """
+        batch_size = len(responses_list)
+        n_samples = len(responses_list[0])
+        
+        all_nll_scores = []
+        
+        for i in range(batch_size):
+            prompt_ids = prompts_ids[i:i+1]  # [1, prompt_length]
+            prompt_mask = attention_masks[i:i+1]
+            
+            # Collect all responses for this prompt
+            responses = responses_list[i]  # [n_samples][response_length]
+            
+            # Batch process all responses at once
+            batch_input_ids = []
+            batch_attention_masks = []
+            batch_lengths = []
+            
+            for response_ids in responses:
+                # Concatenate prompt + response
+                full_ids = torch.cat([prompt_ids.squeeze(0), response_ids], dim=0)
+                full_mask = torch.ones_like(full_ids)
+                
+                batch_input_ids.append(full_ids)
+                batch_attention_masks.append(full_mask)
+                batch_lengths.append(len(response_ids))
+            
+            # Pad to same length
+            max_len = max(len(ids) for ids in batch_input_ids)
+            padded_input_ids = []
+            padded_attention_masks = []
+            
+            for ids, mask in zip(batch_input_ids, batch_attention_masks):
+                pad_len = max_len - len(ids)
+                if pad_len > 0:
+                    padded_ids = torch.cat([ids, torch.full((pad_len,), self.tokenizer.pad_token_id, 
+                                                            dtype=ids.dtype, device=ids.device)])
+                    padded_mask = torch.cat([mask, torch.zeros(pad_len, dtype=mask.dtype, device=mask.device)])
+                else:
+                    padded_ids = ids
+                    padded_mask = mask
+                
+                padded_input_ids.append(padded_ids)
+                padded_attention_masks.append(padded_mask)
+            
+            # Stack into batch
+            batch_input_ids = torch.stack(padded_input_ids).to(self.device_name)  # [n_samples, max_len]
+            batch_attention_masks = torch.stack(padded_attention_masks).to(self.device_name)
+            
+            # Compute log probs for entire batch
+            with torch.no_grad(), torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+                outputs = self.fsdp_model(
+                    input_ids=batch_input_ids,
+                    attention_mask=batch_attention_masks,
+                    use_cache=False
+                )
+                logits = outputs.logits  # [n_samples, max_len, vocab_size]
+                
+                # Compute log probabilities for each token
+                log_probs_list = []
+                for j in range(n_samples):
+                    # Get response part only (exclude prompt)
+                    prompt_len = prompt_ids.shape[1]
+                    response_len = batch_lengths[j]
+                    
+                    # Get logits for response tokens
+                    response_logits = logits[j, prompt_len-1:prompt_len-1+response_len]  # [response_len, vocab_size]
+                    response_labels = batch_input_ids[j, prompt_len:prompt_len+response_len]  # [response_len]
+                    
+                    # Compute log probability
+                    log_probs = torch.nn.functional.log_softmax(response_logits, dim=-1)
+                    token_log_probs = log_probs.gather(1, response_labels.unsqueeze(-1)).squeeze(-1)
+                    
+                    # Sum and normalize by length
+                    total_log_prob = token_log_probs.sum()
+                    nll = -total_log_prob / response_len
+                    log_probs_list.append(nll)
+                
+                all_nll_scores.append(torch.stack(log_probs_list))
+        
+        return torch.stack(all_nll_scores)  # [batch_size, n_samples]
+    
+    def _generate_preference_pairs(self, batch, n_samples=4, temperature=1.0, min_margin=0.1):
+        """
+        动态生成偏好对
+        
+        Args:
+            batch: 包含输入数据的字典
+            n_samples: 每个prompt采样的响应数量
+            temperature: 采样温度
+            min_margin: 最小质量差距阈值
+            
+        Returns:
+            valid_prompts: 有效的prompts
+            winner_responses: 质量较好的响应
+            loser_responses: 质量较差的响应
+            valid_indices: 有效样本的索引
+        """
+        input_ids = batch["input_ids"].to(self.device_name)
+        attention_mask = batch["attention_mask"].to(self.device_name)
+        
+        # Extract prompt part (assuming labels/loss_mask indicates response part)
+        # Here we assume the prompt ends where loss_mask becomes 1
+        loss_mask = batch.get("loss_mask", None)
+        if loss_mask is None:
+            # If no loss_mask, use the entire input as prompt+response
+            # and we need to identify the prompt part differently
+            raise ValueError("loss_mask is required to identify prompt/response boundary")
+        
+        batch_size = input_ids.shape[0]
+        prompts_ids = []
+        prompts_masks = []
+        
+        # Find where each prompt ends (first position where loss_mask is 1)
+        for i in range(batch_size):
+            # Find first non-zero in loss_mask (accounting for shifted labels)
+            mask = loss_mask[i]
+            if mask.sum() > 0:
+                first_response_token = (mask > 0).nonzero(as_tuple=True)[0][0].item()
+                # Add 1 because loss_mask is shifted by 1 relative to input_ids
+                prompt_end = first_response_token + 1
+            else:
+                # If no loss mask, use entire sequence as prompt
+                prompt_end = input_ids.shape[1]
+            
+            prompts_ids.append(input_ids[i, :prompt_end])
+            prompts_masks.append(attention_mask[i, :prompt_end])
+        
+        # Pad prompts to same length for batching
+        max_prompt_len = max(len(p) for p in prompts_ids)
+        padded_prompts_ids = []
+        padded_prompts_masks = []
+        
+        for ids, mask in zip(prompts_ids, prompts_masks):
+            pad_len = max_prompt_len - len(ids)
+            if pad_len > 0:
+                padded_ids = torch.cat([
+                    torch.full((pad_len,), self.tokenizer.pad_token_id, dtype=ids.dtype, device=ids.device),
+                    ids
+                ])
+                padded_mask = torch.cat([
+                    torch.zeros(pad_len, dtype=mask.dtype, device=mask.device),
+                    mask
+                ])
+            else:
+                padded_ids = ids
+                padded_mask = mask
+            
+            padded_prompts_ids.append(padded_ids)
+            padded_prompts_masks.append(padded_mask)
+        
+        prompts_ids_batch = torch.stack(padded_prompts_ids)
+        prompts_masks_batch = torch.stack(padded_prompts_masks)
+        
+        # Sample responses
+        sampled_responses = self._sample_responses(
+            prompts=None,  # We don't need text prompts
+            input_ids=prompts_ids_batch,
+            attention_mask=prompts_masks_batch,
+            n_samples=n_samples,
+            temperature=temperature
+        )
+        
+        # Compute NLL scores
+        nll_scores = self._compute_nll_scores(
+            prompts_ids_batch, 
+            sampled_responses, 
+            prompts_masks_batch
+        )  # [batch_size, n_samples]
+        
+        # Select winner and loser based on NLL scores
+        winner_responses = []
+        loser_responses = []
+        valid_indices = []
+        winner_full_ids = []
+        loser_full_ids = []
+        
+        for i in range(batch_size):
+            scores = nll_scores[i]  # [n_samples]
+            
+            # Find min and max NLL
+            min_idx = torch.argmin(scores).item()
+            max_idx = torch.argmax(scores).item()
+            
+            # Check quality margin
+            quality_margin = scores[max_idx] - scores[min_idx]
+            
+            if quality_margin < min_margin or min_idx == max_idx:
+                continue
+            
+            # Get winner and loser responses
+            winner_resp = sampled_responses[i][min_idx]
+            loser_resp = sampled_responses[i][max_idx]
+            
+            # Concatenate prompt + response for full sequences
+            prompt = prompts_ids[i]
+            winner_full = torch.cat([prompt, winner_resp])
+            loser_full = torch.cat([prompt, loser_resp])
+            
+            winner_responses.append(winner_resp)
+            loser_responses.append(loser_resp)
+            winner_full_ids.append(winner_full)
+            loser_full_ids.append(loser_full)
+            valid_indices.append(i)
+        
+        if len(valid_indices) == 0:
+            return None, None, None, None, []
+        
+        # Get valid prompts
+        valid_prompts_ids = [prompts_ids[i] for i in valid_indices]
+        
+        return valid_prompts_ids, winner_full_ids, loser_full_ids, winner_responses, loser_responses, valid_indices
+    
+    def _compute_simpo_loss(self, prompts_ids, winner_full_ids, loser_full_ids, 
+                            winner_responses, loser_responses, beta=0.1, gamma=0.5):
+        """
+        计算SimPO损失
+        
+        Args:
+            prompts_ids: List of prompt token ids
+            winner_full_ids: List of winner full sequence (prompt + response)
+            loser_full_ids: List of loser full sequence (prompt + response)
+            winner_responses: List of winner response token ids (for length calculation)
+            loser_responses: List of loser response token ids
+            beta: 奖励缩放系数
+            gamma: 目标奖励差
+            
+        Returns:
+            simpo_loss: SimPO损失值
+        """
+        batch_size = len(prompts_ids)
+        
+        # Prepare batched inputs for winner and loser
+        def prepare_batch(full_ids_list):
+            max_len = max(len(ids) for ids in full_ids_list)
+            padded_ids = []
+            attention_masks = []
+            
+            for ids in full_ids_list:
+                pad_len = max_len - len(ids)
+                if pad_len > 0:
+                    padded = torch.cat([
+                        ids,
+                        torch.full((pad_len,), self.tokenizer.pad_token_id, dtype=ids.dtype, device=ids.device)
+                    ])
+                    mask = torch.cat([
+                        torch.ones(len(ids), dtype=torch.long, device=ids.device),
+                        torch.zeros(pad_len, dtype=torch.long, device=ids.device)
+                    ])
+                else:
+                    padded = ids
+                    mask = torch.ones(len(ids), dtype=torch.long, device=ids.device)
+                
+                padded_ids.append(padded)
+                attention_masks.append(mask)
+            
+            return torch.stack(padded_ids), torch.stack(attention_masks)
+        
+        winner_ids, winner_masks = prepare_batch(winner_full_ids)
+        loser_ids, loser_masks = prepare_batch(loser_full_ids)
+        
+        # Compute log probabilities
+        def get_sequence_log_probs(input_ids, attention_mask, response_starts, response_lengths):
+            """Calculate log probability of the response part"""
+            with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+                outputs = self.fsdp_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    use_cache=False
+                )
+                logits = outputs.logits  # [batch_size, seq_len, vocab_size]
+                
+                log_probs_list = []
+                for i in range(len(response_starts)):
+                    start = response_starts[i]
+                    length = response_lengths[i]
+                    
+                    # Get response logits (shifted by 1)
+                    response_logits = logits[i, start-1:start-1+length]
+                    response_labels = input_ids[i, start:start+length]
+                    
+                    # Compute log probabilities
+                    log_probs = torch.nn.functional.log_softmax(response_logits, dim=-1)
+                    token_log_probs = log_probs.gather(1, response_labels.unsqueeze(-1)).squeeze(-1)
+                    
+                    total_log_prob = token_log_probs.sum()
+                    log_probs_list.append(total_log_prob)
+                
+                return torch.stack(log_probs_list)
+        
+        # Get response start positions and lengths
+        winner_starts = [len(p) for p in prompts_ids]
+        loser_starts = winner_starts
+        winner_lengths = [len(r) for r in winner_responses]
+        loser_lengths = [len(r) for r in loser_responses]
+        
+        # Calculate log probabilities
+        log_probs_winner = get_sequence_log_probs(winner_ids, winner_masks, winner_starts, winner_lengths)
+        log_probs_loser = get_sequence_log_probs(loser_ids, loser_masks, loser_starts, loser_lengths)
+        
+        # Convert lengths to tensor
+        len_winner = torch.tensor(winner_lengths, dtype=torch.float32, device=log_probs_winner.device)
+        len_loser = torch.tensor(loser_lengths, dtype=torch.float32, device=log_probs_loser.device)
+        
+        # Compute length-normalized rewards
+        reward_winner = beta * (log_probs_winner / len_winner)
+        reward_loser = beta * (log_probs_loser / len_loser)
+        
+        # SimPO loss
+        logits = reward_winner - reward_loser - gamma
+        simpo_loss = -torch.nn.functional.logsigmoid(logits).mean()
+        
+        return simpo_loss
+    
+    def training_step_simpo(self, batch: TensorDict):
+        """
+        SimPO训练步骤
+        """
+        start_time = time.time()
+        
+        self.optimizer.zero_grad()
+        
+        # Hyperparameters for SimPO
+        n_samples = self.config.simpo.get("n_samples", None)
+        temperature = self.config.simpo.get("temperature", None)
+        min_margin = self.config.simpo.get("min_margin", None)
+        beta = self.config.simpo.get("beta", None)
+        gamma = self.config.simpo.get("gamma", None)
+        
+        # Generate preference pairs
+        result = self._generate_preference_pairs(
+            batch=batch,
+            n_samples=n_samples,
+            temperature=temperature,
+            min_margin=min_margin
+        )
+        
+        valid_prompts_ids, winner_full_ids, loser_full_ids, winner_responses, loser_responses, valid_indices = result
+        
+        # Skip if no valid pairs
+        if len(valid_indices) == 0:
+            if self.device_mesh.get_rank() == 0:
+                print(f"Warning: No valid preference pairs in this batch, skipping...")
+            return {
+                "train/loss": 0.0,
+                "train/lr(1e-3)": self.lr_scheduler.get_last_lr()[0] * 1e3,
+                "train/time(s)": time.time() - start_time,
+                "train/valid_pairs": 0,
+                "train/skip_rate": 1.0,
+            }
+        
+        # Compute SimPO loss
+        simpo_loss = self._compute_simpo_loss(
+            prompts_ids=valid_prompts_ids,
+            winner_full_ids=winner_full_ids,
+            loser_full_ids=loser_full_ids,
+            winner_responses=winner_responses,
+            loser_responses=loser_responses,
+            beta=beta,
+            gamma=gamma
+        )
+        
+        # Backward
+        simpo_loss.backward()
+        
+        # Gradient clipping
+        if self.config.model.strategy == "fsdp":
+            grad_norm = self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
+        elif self.config.model.strategy == "fsdp2":
+            grad_norm = fsdp2_clip_grad_norm_(self.fsdp_model.parameters(), max_norm=self.config.optim.clip_grad)
+        else:
+            raise NotImplementedError(f"not implement {self.config.model.strategy}")
+        
+        # Optimizer step
+        if not torch.isfinite(grad_norm):
+            print(f"WARN: grad_norm is not finite: {grad_norm}")
+            self.optimizer.zero_grad()
+        else:
+            self.optimizer.step()
+        
+        self.lr_scheduler.step()
+        
+        # Logging
+        lr = self.lr_scheduler.get_last_lr()[0]
+        end_time = time.time()
+        spend_time_per_step = end_time - start_time
+        
+        loss_tensor = simpo_loss.detach()
+        if is_cuda_available:
+            torch.distributed.all_reduce(loss_tensor, op=torch.distributed.ReduceOp.AVG)
+        elif is_npu_available:
+            torch.distributed.all_reduce(loss_tensor)
+            loss_tensor /= self.device_mesh.size(0)
+        
+        batch_size = batch["input_ids"].shape[0]
+        skip_rate = 1.0 - len(valid_indices) / batch_size
+        
+        return {
+            "train/loss": loss_tensor.item(),
+            "train/lr(1e-3)": lr * 1e3,
+            "train/time(s)": spend_time_per_step,
+            "train/valid_pairs": len(valid_indices),
+            "train/skip_rate": skip_rate,
+        }
+    
     def fit(self):
+        """
+        修改fit方法以支持SimPO训练
+        """
         rank = self.device_mesh.get_rank()
-
-        # TODO: add a unified tracking
+        
+        # Check if using SimPO mode
+        use_simpo = self.config.get("use_simpo", False)
+        
         if rank == 0:
             tracking = Tracking(
                 project_name=self.config.trainer.project_name,
@@ -895,41 +1181,22 @@ class FSDPSFTTrainer:
                 default_backend=self.config.trainer.logger,
                 config=OmegaConf.to_container(self.config, resolve=True),
             )
-
-        global_step = self.resume_global_step  # Start from resumed step
+        
+        global_step = self.resume_global_step
         last_valid_metric = None
-        # compute the total training steps.
-        # the total training steps in SFT is mainly for early exit
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
-
+        
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = self.config.trainer.total_training_steps
-
+        
         self.total_training_steps = total_training_steps
-        log_with_rank(
-            f"Total training steps: {self.total_training_steps},",
-            logger=logger,
-            rank=self.device_mesh.get_rank(),
-            log_only_rank_0=True,
-        )
-
-        # With StatefulDataLoader, we don't need to manually calculate epochs and steps
-        # The dataloader will automatically resume from where it left off
-        if global_step > 0:
-            log_with_rank(
-                f"StatefulDataLoader will automatically resume from global step: {global_step}",
-                logger=logger,
-                rank=self.device_mesh.get_rank(),
-                log_only_rank_0=True,
-            )
-
-        # Calculate which epoch we're starting from for sampler.set_epoch()
+        
         start_epoch = global_step // self.steps_per_epoch
-
         train_time = 0
+        
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
-
+            
             for step_in_epoch, data in enumerate(
                 tqdm(
                     self.train_dataloader,
@@ -941,18 +1208,23 @@ class FSDPSFTTrainer:
             ):
                 global_step += 1
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size).to(self.device_name)
-                metric = self.training_step(data)
+                
+                # Choose training step based on mode
+                if use_simpo:
+                    metric = self.training_step_simpo(data)
+                else:
+                    metric = self.training_step(data)
+                
                 train_time += metric["train/time(s)"]
                 if rank == 0:
                     tracking.log(data=metric, step=global_step)
-
+                
                 is_last_step = global_step >= self.total_training_steps
                 is_valid_step = global_step % self.config.trainer.test_freq == 0
                 is_save_step = global_step % self.config.trainer.save_freq == 0
-
-                # early exit or validation step
+                
+                # Validation and checkpointing logic remains the same
                 if is_last_step or (self.config.trainer.test_freq > 0 and is_valid_step):
-                    # Perform validation
                     val_losses = []
                     for val_data in self.val_dataloader:
                         val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).to(
@@ -966,376 +1238,15 @@ class FSDPSFTTrainer:
                         tracking.log(data=metric, step=global_step)
                         last_valid_metric = metric
                     torch.distributed.barrier()
-
+                
                 if is_last_step or (self.config.trainer.save_freq > 0 and is_save_step):
                     self.save_checkpoint(step=global_step)
-
+                
                 if is_last_step:
                     if rank == 0:
                         print(f"Total time for train steps: {train_time:.2f}s")
                         print(f"Final validation metrics: {last_valid_metric}")
                     return
-
-    def _sample_sequence(self, model, input_ids, attention_mask, max_length=None):
-        generation_model = model
-        generation_model.eval()
-
-        if max_length is None:
-            max_length = self.config.data.max_length
-
-        with torch.no_grad():
-            generated = generation_model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_length=max_length,
-                do_sample=False,
-                pad_token_id=self.tokenizer.pad_token_id,
-            )
-        return generated
-
-    def _get_token_logits(self, model, input_ids, attention_mask, position_ids):
-        infer_model = model
-        infer_model.eval()
-        with torch.no_grad(), torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
-            output = infer_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                use_cache=False,
-            )
-        return output.logits
-
-    def _construct_soft_labels(self, batch: TensorDict, outer_iter: int) -> TensorDict:
-        batch_soft_labels = batch.clone()
-        batch_soft_labels = batch_soft_labels.to(self.device_name)
-
-        input_ids = batch_soft_labels["input_ids"].to(self.device_name)
-        attention_mask = batch_soft_labels["attention_mask"].to(self.device_name)
-        position_ids = batch_soft_labels["position_ids"].to(self.device_name)
-        loss_mask = batch_soft_labels["loss_mask"].to(self.device_name)
-
-        use_gold = True
-        sequence_ids = input_ids
-
-        # rank = torch.distributed.get_rank()
-        # if rank == 0:
-        #     use_gold = torch.rand(1, device=self.device_name).item() < self.soft_label_gold_ratio
-
-        # if use_gold:
-        #     sequence_ids = input_ids
-        # else:
-        #     sequence_ids = self._sample_sequence(self.fsdp_model, input_ids, attention_mask)
-        #     # Align sampled sequence length with the gold sequence
-        #     target_length = input_ids.shape[1]
-        #     if sequence_ids.shape[1] > target_length:
-        #         sequence_ids = sequence_ids[:, :target_length]
-        #     elif sequence_ids.shape[1] < target_length:
-        #         pad_length = target_length - sequence_ids.shape[1]
-        #         pad_token = self.tokenizer.pad_token_id
-        #         sequence_ids = F.pad(sequence_ids, (0, pad_length), value=pad_token)
-
-        logits_reference = self._get_token_logits(self.fsdp_model_reference, sequence_ids, attention_mask, position_ids)
-        logits_sft = self._get_token_logits(self.fsdp_model_sft, sequence_ids, attention_mask, position_ids)
-
-        log_reference = F.log_softmax(logits_reference, dim=-1)
-        log_sft = F.log_softmax(logits_sft, dim=-1)
-
-        if self.use_dynamic_alpha:
-            alpha = min(self.soft_label_alpha + 0.1 * outer_iter / max(self.n_outer_iterations - 1, 1), 0.9)
-        else:
-            alpha = self.soft_label_alpha
-
-        log_p_star = (1.0 - alpha) * log_reference + alpha * log_sft
-        soft_labels = F.softmax(log_p_star, dim=-1).to(torch.bfloat16)
-
-        batch_size = input_ids.shape[0]
-        batch_soft_labels["sequence_ids"] = sequence_ids
-        batch_soft_labels["soft_labels"] = soft_labels
-        use_gold_tensor = torch.full((batch_size,), use_gold, device=self.device_name, dtype=torch.bool)
-        batch_soft_labels["use_gold"] = use_gold_tensor
-        batch_soft_labels["loss_mask"] = loss_mask
-        batch_soft_labels['attention_mask'] = attention_mask
-        batch_soft_labels['position_ids'] = position_ids
-
-        return batch_soft_labels
-    
-    def _compute_soft_label_loss(self, batch: TensorDict, do_backward=True, n_micro_batches=1):
-        use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
-
-        labels = batch['soft_labels'].to(self.device_name)
-        input_ids = batch["sequence_ids"].to(self.device_name)
-        attention_mask = batch["attention_mask"].to(self.device_name)
-        position_ids = batch["position_ids"].to(self.device_name)
-        # loss_mask = batch.pop("loss_mask")[:, 1:].reshape(-1).to(self.device_name)
-        loss_mask = batch.pop("loss_mask").reshape(-1).to(self.device_name)
-        # loss_fct = nn.CrossEntropyLoss(reduction="none")
-        loss_fct = nn.KLDivLoss(reduction="none")
-
-        context = self.sharding_manager if use_sp else nullcontext()
-        with context, torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
-            if not use_sp:
-                output = self.fsdp_model(
-                    input_ids=input_ids
-                    , attention_mask=attention_mask
-                    , position_ids=position_ids
-                    , use_cache=False
-                )
-                logits = output.logits
-                # print('1 shift_logits.shape:', logits.shape)
-                # print('1 shift_labels.shape:', labels.shape)
-
-                # shift_logits = logits[..., :-1, :].contiguous()
-                # shift_labels = labels[..., 1:, :].contiguous()
-                shift_logits = logits.contiguous()
-                shift_labels = labels.contiguous()
-                # print('2 shift_logits.shape:', shift_logits.shape)
-                # print('2 shift_labels.shape:', shift_labels.shape)
-
-                # Flatten the tokens
-                shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
-                shift_labels = shift_labels.view(-1, self.model.config.vocab_size)
-                log_shift_logits = F.log_softmax(shift_logits, dim=-1)
-
-                # print('3 shift_logits.shape', shift_logits.shape)
-                # print('3 shift_labels.shape:', shift_labels.shape)
-                # Enable model parallelism
-                shift_labels = shift_labels.to(shift_logits.device)
-                loss = loss_fct(log_shift_logits, shift_labels)
-                loss = loss.sum(dim=-1)
-                loss = loss * loss_mask.to(loss.device)
-
-        valid_token_this_rank = torch.sum(loss_mask)
-        if self.config.data.balance_dp_token:
-            torch.distributed.all_reduce(valid_token_this_rank)
-            dp_size = self.ulysses_device_mesh.size("dp") if use_sp else torch.distributed.get_world_size()
-        else:
-            dp_size = 1
-
-        loss = torch.sum(loss) / (valid_token_this_rank + 1e-8) * dp_size
-
-        loss = loss / n_micro_batches  # normalize loss
-
-        if do_backward:
-            loss.backward()
-        return loss
-
-    def training_step_for_final_model(self, batch: TensorDict):
-        start_time = time.time()
-        self.fsdp_model.train() # 设置为训练模式
-        self.fsdp_model.zero_grad() # 使用新的优化器清零梯度
-
-        # micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
-        # n_micro_batches = len(micro_batches)
-        step_loss = 0
-
-        # for micro_batch in micro_batches:
-        #     loss = self._compute_soft_label_loss(
-        #         batch=micro_batch,
-        #         n_micro_batches=n_micro_batches,
-        #     )
-        #     step_loss += loss.item()
-
-        loss = self._compute_soft_label_loss(
-                batch=batch,
-                n_micro_batches=len(batch),
-            )
-        step_loss += loss.item()
-
-        if self.config.model.strategy == "fsdp":
-            grad_norm = self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
-        elif self.config.model.strategy == "fsdp2":
-            grad_norm = fsdp2_clip_grad_norm_(self.fsdp_model.parameters(), max_norm=self.config.optim.clip_grad)
-        else:
-            raise NotImplementedError(f"not implement {self.config.model.strategy}")
-
-        # 检查梯度是否有效
-        if not torch.isfinite(grad_norm):
-            print(f"WARN: grad_norm for 'fsdp_model' is not finite: {grad_norm}")
-            self.optimizer.zero_grad() # 如果梯度爆炸，就跳过更新
-        else:
-            # 使用新的优化器更新参数
-            self.optimizer.step()
-
-        self.lr_scheduler.step()
-
-        lr = self.lr_scheduler.get_last_lr()[0]
-
-        step_loss = torch.tensor(step_loss).to(self.device_name)
-        end_time = time.time()
-        spend_time_per_step = end_time - start_time
-
-        if is_cuda_available:
-            torch.distributed.all_reduce(step_loss, op=torch.distributed.ReduceOp.AVG)
-        elif is_npu_available:
-            torch.distributed.all_reduce(step_loss)
-            step_loss /= self.device_mesh.size(0)
-
-        return {
-            # "stage": "2. train_final_model",
-            "fsdp_model/train/loss": step_loss.detach().item(),
-            "train_final_model/lr(1e-3)": lr * 1e3,
-            "train_final_model/time(s)": spend_time_per_step,
-        }
-
-    def fit_less_forgetting(self):
-        rank = self.device_mesh.get_rank()
-
-        # TODO: add a unified tracking
-        if rank == 0:
-            tracking = Tracking(
-                project_name=self.config.trainer.project_name,
-                experiment_name=self.config.trainer.experiment_name,
-                default_backend=self.config.trainer.logger,
-                config=OmegaConf.to_container(self.config, resolve=True),
-            )
-
-        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs * self.n_outer_iterations
-        if self.config.trainer.total_training_steps is not None:
-            total_training_steps = self.config.trainer.total_training_steps
-        self.total_training_steps = total_training_steps
-
-        log_with_rank(
-            f"Total training steps: {self.total_training_steps},",
-            logger=logger,
-            rank=self.device_mesh.get_rank(),
-            log_only_rank_0=True,
-        )
-
-        global_step = self.resume_global_step  # Start from resumed step
-        train_time = 0 
-        for outer_iter in range(self.n_outer_iterations):
-            
-            self.train_sampler.set_epoch(epoch=outer_iter)
-
-            if rank == 0:
-                print("\n" + "=" * 60)
-                print(f"Outer iteration {outer_iter + 1}/{self.n_outer_iterations}")
-                print("=" * 60)
-
-            
-            # ================== Stage 1: Create and train sft model ==================
-            if rank == 0:
-                print(f"\n[Stage 1] Training sft model on original data...")
-
-            for sft_step, data in enumerate(
-                tqdm(
-                    self.train_dataloader,
-                    desc=f"Stage 1 (outer {outer_iter + 1})",
-                    disable=rank != 0,
-                )
-            ):
-                data = TensorDict(data, batch_size=self.config.data.train_batch_size).to(self.device_name)
-                metric = self.training_step_for_sft(batch=data, current_outer_iteration=outer_iter)
-                
-                global_step += 1
-
-                train_time += metric["train_for_sft/time(s)"]
-                if rank == 0 and sft_step % 10 == 0:
-                    tracking.log(data=metric, step=global_step)
-
-            if rank == 0:
-                tracking.log(data=metric, step=global_step)
-                print(f"Stage 1 completed.")
-            
-            # ================== Stage 2: Construct soft labels ==================
-            if rank == 0:
-                print(f"[Stage 2] Training fsdp_model with less forgetting...")
-
-            # soft_label_dataset = []
-
-            for step, data in enumerate(
-                tqdm(
-                    self.train_dataloader,
-                    desc=f"Stage 2 (outer {outer_iter + 1})",
-                    disable=rank != 0,
-                )
-            ):
-                data = TensorDict(data, batch_size=self.config.data.train_batch_size)
-                micro_batches = data.split(self.config.data.micro_batch_size_per_gpu)
-
-                # print(f"[Stage 2] Processing {len(micro_batches)} micro-batches.")
-
-                metric = None
-                for micro_batch in micro_batches:
-                    # print(len(micro_batch))
-                    soft_batch = self._construct_soft_labels(micro_batch, outer_iter)
-                    metric = self.training_step_for_final_model(batch=soft_batch)
-                    train_time += metric["train_final_model/time(s)"]
-
-                # soft_batch = self._construct_soft_labels(data, outer_iter)
-
-                # soft_label_dataset.append(soft_batch.cpu())
-                if rank == 0:
-                    tracking.log(metric, step=global_step)
-
-                global_step += 1
-
-                is_save_step = global_step % self.config.trainer.save_freq == 0
-
-                if self.config.trainer.save_freq > 0 and is_save_step:
-                    self.save_checkpoint(step=global_step)
-
-            if rank == 0:
-                # print(f"[Stage 2] completed. Constructed {len(soft_label_dataset)} soft-labeled batches.")
-                print(f"[Stage 2] completed.")
-
-            # torch.cuda.empty_cache()
-            # # ================== Stage 3: Train p on soft labels ==================
-            # if rank == 0:
-            #     print(f"\n[Stage 3] Training policy model p on soft labels...")
-
-            # for step, soft_batch in enumerate(tqdm(
-            #     soft_label_dataset,
-            #     desc=f"Stage 3 (Outer {outer_iter+1})",
-            #     disable=rank != 0
-            # )):
-            #     soft_batch = soft_batch.to(self.device_name)
-            #     metric = self.training_step_for_final_model(batch=soft_batch)
-            #     train_time += metric["train_final_model/time(s)"]
-
-            #     global_step += 1
-
-            #     if rank == 0:
-            #         tracking.log(metric, step=global_step)
-
-            #     is_save_step = global_step % self.config.trainer.save_freq == 0
-
-            #     if self.config.trainer.save_freq > 0 and is_save_step:
-            #         self.save_checkpoint(step=global_step)
-
-            # if rank == 0:
-            #     print(f"Stage 3 completed. ")
-
-                # is_last_step = global_step >= self.total_training_steps
-                # is_valid_step = global_step % self.config.trainer.test_freq == 0
-                # is_save_step = global_step % self.config.trainer.save_freq == 0
-
-                # # early exit or validation step
-                # if is_last_step or (self.config.trainer.test_freq > 0 and is_valid_step):
-                #     # Perform validation
-                #     val_losses = []
-                #     for val_data in self.val_dataloader:
-                #         val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).to(
-                #             self.device_name
-                #         )
-                #         val_loss = self.validation_step(val_data)
-                #         val_losses.append(val_loss)
-                #     if rank == 0:
-                #         val_loss = torch.mean(torch.stack(val_losses))
-                #         metric = {"val/loss": val_loss.detach().item()}
-                #         tracking.log(data=metric, step=global_step)
-                #         last_valid_metric = metric
-                #     torch.distributed.barrier()
-
-                # if is_last_step or (self.config.trainer.save_freq > 0 and is_save_step):
-                #     self.save_checkpoint(step=global_step)
-
-                # if is_last_step:
-                #     if rank == 0:
-                #         print(f"Total time for train steps: {train_time:.2f}s")
-                #         print(f"Final validation metrics: {last_valid_metric}")
-                #     return
-
 
 def run_sft(config):
     device_name = get_device_name()
@@ -1369,13 +1280,7 @@ def run_sft(config):
         val_dataset=val_dataset,
     )
 
-    anti_forgetting_flag = bool(getattr(config.trainer, "anti_forgetting", False))
-    if rank == 0:
-        print(f"===============\nanti_forgetting_flag: {anti_forgetting_flag}\n===============")
-    if anti_forgetting_flag:
-        trainer.fit_less_forgetting()
-    else:   
-        trainer.fit()
+    trainer.fit()
 
     destroy_global_process_group()
 
