@@ -928,7 +928,18 @@ class FSDPSFTTrainer:
     # ========== 新增：训练最终模型（使用软标签）==========
     def training_step_for_final_model(self, batch):
         """
-        使用软标签训练最终模型 p_final
+        方案1: 逐位置训练 - 流式处理版本
+        
+        关键改进：
+        1. 流式生成展开样本：生成 micro_batch_size 个样本后立即训练
+        2. 避免一次性展开整个 batch，大幅降低内存占用
+        3. 逐样本、逐位置处理，内存友好
+        
+        对于原始样本 (x, y)，展开为：
+        - (x, y[0], soft_label_1)
+        - (x + y[0], y[1], soft_label_2)
+        - (x + y[0:1], y[2], soft_label_3)
+        - ...
         """
         start_time = time.time()
         self.fsdp_model.train()
@@ -939,27 +950,89 @@ class FSDPSFTTrainer:
         
         log_gpu_memory_usage("After optimizer zero_grad", logger=logger)
         
+        step_loss = 0
+        total_positions = 0
+        total_micro_batches = 0
+        
         micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
         n_micro_batches = len(micro_batches)
-        
-        step_loss = 0
-        
-        for micro_batch in micro_batches:
-            loss_mask = micro_batch.pop('loss_mask')
-            # 构造软标签
-            soft_labels, loss_mask = self._construct_soft_labels(micro_batch, loss_mask)
+        for micro_batch in tqdm(micro_batches):
+            # 先构造整个 batch 的软标签（一次性，高效）
+            all_soft_labels = self._construct_all_soft_labels(micro_batch)
             
-            # 计算损失
-            loss = self._compute_loss_with_soft_labels(
-                batch=micro_batch,
-                loss_mask=loss_mask,
-                soft_labels=soft_labels,
-                n_micro_batches=n_micro_batches,
-            )
+            device = self.device_name
+            input_ids = micro_batch["input_ids"].to(device)
+            attention_mask = micro_batch["attention_mask"].to(device)
+            position_ids = micro_batch["position_ids"].to(device)
+            loss_mask = micro_batch["loss_mask"].to(device)
+            batch_size, seq_len = input_ids.shape
             
-            # 反向传播
-            loss.backward()
-            step_loss += loss.item()
+            # 流式生成和训练
+            # micro_batch_size = self.config.data.micro_batch_size_per_gpu
+            micro_batch_size = self.config.data.micro_batch_for_final
+            current_micro_batch = {
+                'input_ids': [],
+                'attention_mask': [],
+                'position_ids': [],
+                'soft_labels': [],
+            }
+            
+            # 遍历 batch 中的每个样本
+            for b in range(batch_size):
+                sample_input_ids = input_ids[b]
+                sample_attention_mask = attention_mask[b]
+                sample_position_ids = position_ids[b]
+                sample_loss_mask = loss_mask[b]
+                sample_soft_labels = all_soft_labels[b]
+                
+                # 遍历每个位置 t
+                for t in range(1, seq_len):
+                    # 检查是否需要在该位置计算损失
+                    if sample_loss_mask[t] == 0:
+                        continue
+                    
+                    # 构造前缀: x + y[:t]
+                    prefix_input_ids = sample_input_ids[:t]
+                    prefix_attention_mask = sample_attention_mask[:t]
+                    prefix_position_ids = sample_position_ids[:t]
+                    target_soft_label = sample_soft_labels[t-1]
+                    
+                    # 添加到当前 micro batch
+                    current_micro_batch['input_ids'].append(prefix_input_ids)
+                    current_micro_batch['attention_mask'].append(prefix_attention_mask)
+                    current_micro_batch['position_ids'].append(prefix_position_ids)
+                    current_micro_batch['soft_labels'].append(target_soft_label)
+                    
+                    # 当累积到 micro_batch_size 个样本时，立即训练
+                    if len(current_micro_batch['input_ids']) >= micro_batch_size:
+                        loss, n_positions = self._train_on_micro_batch(current_micro_batch, device)
+                        step_loss += loss
+                        total_positions += n_positions
+                        total_micro_batches += 1
+                        
+                        # 清空 micro batch
+                        current_micro_batch = {
+                            'input_ids': [],
+                            'attention_mask': [],
+                            'position_ids': [],
+                            'soft_labels': [],
+                        }
+            
+            # 处理剩余的样本（不足 micro_batch_size）
+            if len(current_micro_batch['input_ids']) > 0:
+                loss, n_positions = self._train_on_micro_batch(current_micro_batch, device)
+                step_loss += loss
+                total_positions += n_positions
+                total_micro_batches += 1
+            
+            if total_micro_batches == 0:
+                if self.device_mesh.get_rank() == 0:
+                    print("Warning: No valid positions in batch, skipping")
+                return {
+                    "final_model/train/loss": 0.0,
+                    "final_model/train/lr(1e-3)": self.lr_scheduler.get_last_lr()[0] * 1e3,
+                    "final_model/train/time(s)": 0.0,
+                }
         
         # 梯度裁剪
         if self.config.model.strategy == "fsdp":
@@ -985,20 +1058,358 @@ class FSDPSFTTrainer:
         lr = self.lr_scheduler.get_last_lr()[0]
         
         step_loss = torch.tensor(step_loss).to(self.device_name)
+        total_positions = torch.tensor(total_positions).to(self.device_name)
+        
         end_time = time.time()
         spend_time_per_step = end_time - start_time
         
         if is_cuda_available:
             torch.distributed.all_reduce(step_loss, op=torch.distributed.ReduceOp.AVG)
+            torch.distributed.all_reduce(total_positions, op=torch.distributed.ReduceOp.SUM)
         elif is_npu_available:
             torch.distributed.all_reduce(step_loss)
+            torch.distributed.all_reduce(total_positions)
             step_loss /= self.device_mesh.size(0)
         
         return {
             "final_model/train/loss": step_loss.detach().item(),
             "final_model/train/lr(1e-3)": lr * 1e3,
             "final_model/train/time(s)": spend_time_per_step,
+            "final_model/train/total_positions": total_positions.detach().item(),
+            "final_model/train/num_micro_batches": total_micro_batches,
         }
+
+    def _train_on_micro_batch(self, micro_batch_data, device):
+        """
+        对一个 micro batch 的展开样本进行训练
+        
+        Args:
+            micro_batch_data: Dict with lists of input_ids, attention_mask, position_ids, soft_labels
+            device: Device to use
+            
+        Returns:
+            loss: Loss value (float)
+            n_positions: Number of positions in this micro batch
+        """
+        # Pad 到相同长度
+        input_ids_list = micro_batch_data['input_ids']
+        attention_mask_list = micro_batch_data['attention_mask']
+        position_ids_list = micro_batch_data['position_ids']
+        soft_labels_list = micro_batch_data['soft_labels']
+        
+        n_samples = len(input_ids_list)
+        max_len = max(len(ids) for ids in input_ids_list)
+        
+        # Pad
+        padded_input_ids = []
+        padded_attention_mask = []
+        padded_position_ids = []
+        
+        for i in range(n_samples):
+            ids = input_ids_list[i]
+            attn = attention_mask_list[i]
+            pos = position_ids_list[i]
+            
+            pad_len = max_len - len(ids)
+            
+            # Pad (pad_token_id = 0)
+            padded_ids = torch.cat([ids, torch.zeros(pad_len, dtype=ids.dtype, device=device)])
+            padded_attn = torch.cat([attn, torch.zeros(pad_len, dtype=attn.dtype, device=device)])
+            padded_pos = torch.cat([pos, torch.zeros(pad_len, dtype=pos.dtype, device=device)])
+            
+            padded_input_ids.append(padded_ids)
+            padded_attention_mask.append(padded_attn)
+            padded_position_ids.append(padded_pos)
+        
+        # Stack 成 batch
+        batch = {
+            'input_ids': torch.stack(padded_input_ids),
+            'attention_mask': torch.stack(padded_attention_mask),
+            'position_ids': torch.stack(padded_position_ids),
+            'soft_labels': torch.stack(soft_labels_list),
+        }
+        
+        # 计算损失
+        loss = self._compute_loss_with_single_position_soft_labels(
+            batch=batch,
+            n_micro_batches=1,  # 每个 micro batch 独立处理
+        )
+        
+        # 反向传播
+        loss.backward()
+        
+        return loss.item(), n_samples
+
+    def _expand_batch_by_position(self, batch):
+        """
+        【已废弃】此函数已被流式处理取代
+        保留用于向后兼容
+        """
+        raise NotImplementedError("This function is deprecated. Use streaming processing in training_step_for_final_model instead.")
+
+
+    def _construct_all_soft_labels(self, batch):
+        """
+        一次性构造 batch 中所有样本、所有位置的软标签
+        
+        对于每个样本的每个位置 t:
+        p*(y_t | x, y_{<t}) = geometric_mean(p0, q_sft)
+        
+        Args:
+            batch: Input batch
+            
+        Returns:
+            soft_labels: (batch_size, seq_len-1, vocab_size)
+        """
+        device = self.device_name
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        position_ids = batch["position_ids"].to(device)
+        
+        batch_size, seq_len = input_ids.shape
+        vocab_size = self.model_config.vocab_size
+        
+        with torch.no_grad(), torch.autocast(device_type=device, dtype=torch.bfloat16):
+            # 一次前向传播获取所有位置的 logits
+            # p0(* | x, y_{<t}) for all t
+            ref_output = self.fsdp_model_reference(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False
+            )
+            ref_logits = ref_output.logits[:, :-1, :].contiguous()  # (batch, seq-1, vocab)
+            
+            # q_sft(* | x, y_{<t}) for all t
+            sft_output = self.fsdp_model_sft(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False
+            )
+            sft_logits = sft_output.logits[:, :-1, :].contiguous()  # (batch, seq-1, vocab)
+            
+            # 几何均值: log p* = 0.5 * (log p0 + log q)
+            log_p0 = F.log_softmax(ref_logits, dim=-1)
+            log_q = F.log_softmax(sft_logits, dim=-1)
+            log_p_star = 0.5 * (log_p0 + log_q)
+            
+            # 归一化
+            soft_labels = F.softmax(log_p_star, dim=-1)
+        
+        return soft_labels  # (batch_size, seq_len-1, vocab_size)
+
+    def _compute_loss_with_single_position_soft_labels(self, batch, n_micro_batches=1):
+        """
+        计算单个位置的软标签损失
+        
+        对于展开后的样本 (prefix, soft_label):
+        - prefix: x + y_{<t}
+        - soft_label: p*(y_t | x, y_{<t})
+        
+        Loss = -log p_model(soft_label | prefix)
+            = -sum_v soft_label[v] * log p_model[v]
+            = KL(soft_label || p_model)
+        
+        Args:
+            batch: Dict with input_ids, attention_mask, position_ids, soft_labels
+            n_micro_batches: Number of micro batches
+            
+        Returns:
+            loss: Scalar loss
+        """
+        device = self.device_name
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        position_ids = batch["position_ids"].to(device)
+        soft_labels = batch["soft_labels"].to(device)  # (batch, vocab_size)
+        
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            # Forward pass
+            output = self.fsdp_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False
+            )
+            
+            # 取最后一个位置的 logits (这是对下一个 token 的预测)
+            logits = output.logits[:, -1, :]  # (batch, vocab_size)
+            log_probs = F.log_softmax(logits, dim=-1)
+            
+            # KL 散度: -sum soft_labels * log p_model
+            # 这里每个样本都只有一个位置需要预测
+            loss = -torch.sum(soft_labels * log_probs, dim=-1)  # (batch,)
+            
+            # 平均
+            loss = torch.mean(loss)
+            loss = loss / n_micro_batches
+        
+        return loss
+
+
+    def _compute_loss_with_single_position_soft_labels(self, batch, n_micro_batches=1):
+        """
+        计算单个位置的软标签损失
+        
+        对于展开后的样本 (prefix, soft_label):
+        - prefix: x + y_{<t}
+        - soft_label: p*(y_t | x, y_{<t})
+        
+        Loss = -log p_model(soft_label | prefix)
+            = -sum_v soft_label[v] * log p_model[v]
+            = KL(soft_label || p_model)
+        
+        Args:
+            batch: Dict with input_ids, attention_mask, position_ids, soft_labels
+            n_micro_batches: Number of micro batches
+            
+        Returns:
+            loss: Scalar loss
+        """
+        device = self.device_name
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        position_ids = batch["position_ids"].to(device)
+        soft_labels = batch["soft_labels"].to(device)  # (batch, vocab_size)
+        
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            # Forward pass
+            output = self.fsdp_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False
+            )
+            
+            # 取最后一个位置的 logits (这是对下一个 token 的预测)
+            logits = output.logits[:, -1, :]  # (batch, vocab_size)
+            log_probs = F.log_softmax(logits, dim=-1)
+            
+            # KL 散度: -sum soft_labels * log p_model
+            # 这里每个样本都只有一个位置需要预测
+            loss = -torch.sum(soft_labels * log_probs, dim=-1)  # (batch,)
+            
+            # 平均
+            loss = torch.mean(loss)
+            loss = loss / n_micro_batches
+        
+        return loss
+
+
+
+    def _construct_soft_labels_position_wise(self, batch, loss_mask):
+        """
+        逐位置构造软标签分布
+        
+        对于序列中的每个位置 t (从 1 到 seq_len-1)：
+        1. 使用前缀 y_{<t} 作为条件上下文
+        2. 获取 p0(* | x, y_{<t}) 和 q_sft(* | x, y_{<t})
+        3. 计算 log p* = 0.5 * (log p0 + log q_sft)
+        4. 归一化得到 p*
+        
+        Args:
+            batch: Input batch with input_ids, attention_mask, position_ids
+            loss_mask: Mask indicating valid positions (batch_size, seq_len)
+            
+        Returns:
+            soft_labels: Tensor of shape (batch_size, seq_len-1, vocab_size)
+            loss_mask: Adjusted mask (batch_size, seq_len-1)
+        """
+        device = self.device_name
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        position_ids = batch["position_ids"].to(device)
+        loss_mask = loss_mask[:, 1:].to(device)
+        
+        batch_size, seq_len = input_ids.shape
+        vocab_size = self.model_config.vocab_size
+        
+        # 初始化软标签存储 (batch_size, seq_len-1, vocab_size)
+        soft_labels = torch.zeros(
+            (batch_size, seq_len - 1, vocab_size),
+            dtype=torch.float32,
+            device=device
+        )
+        
+        with torch.no_grad(), torch.autocast(device_type=device, dtype=torch.bfloat16):
+            # 方案1: 逐位置前向传播（更符合公式，但速度较慢）
+            # 适用于调试或小规模数据
+            use_position_wise = getattr(self.config.trainer, "use_position_wise_forward", False)
+            
+            if use_position_wise:
+                # 逐位置构造
+                for t in range(1, seq_len):
+                    # 构造前缀：x + y_{<t}
+                    prefix_input_ids = input_ids[:, :t]
+                    prefix_attention_mask = attention_mask[:, :t]
+                    prefix_position_ids = position_ids[:, :t]
+                    
+                    # 获取 p0(* | x, y_{<t})
+                    ref_output = self.fsdp_model_reference(
+                        input_ids=prefix_input_ids,
+                        attention_mask=prefix_attention_mask,
+                        position_ids=prefix_position_ids,
+                        use_cache=False
+                    )
+                    # 取最后一个位置的 logits
+                    p0_logits = ref_output.logits[:, -1, :]  # (batch_size, vocab_size)
+                    
+                    # 获取 q_sft(* | x, y_{<t})
+                    sft_output = self.fsdp_model_sft(
+                        input_ids=prefix_input_ids,
+                        attention_mask=prefix_attention_mask,
+                        position_ids=prefix_position_ids,
+                        use_cache=False
+                    )
+                    q_logits = sft_output.logits[:, -1, :]  # (batch_size, vocab_size)
+                    
+                    # 计算 log 概率
+                    log_p0 = F.log_softmax(p0_logits, dim=-1)
+                    log_q = F.log_softmax(q_logits, dim=-1)
+                    
+                    # 几何均值：log p* = 0.5 * (log p0 + log q)
+                    log_p_star = 0.5 * (log_p0 + log_q)
+                    
+                    # 归一化得到概率分布
+                    p_star = F.softmax(log_p_star, dim=-1)
+                    
+                    # 存储到对应位置
+                    soft_labels[:, t-1, :] = p_star
+            
+            else:
+                # 方案2: 一次前向传播（效率更高，推荐用于生产环境）
+                # 一次性获取所有位置的 logits
+                ref_output = self.fsdp_model_reference(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=False
+                )
+                ref_logits = ref_output.logits[:, :-1, :].contiguous()  # (batch, seq-1, vocab)
+                
+                sft_output = self.fsdp_model_sft(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=False
+                )
+                sft_logits = sft_output.logits[:, :-1, :].contiguous()  # (batch, seq-1, vocab)
+                
+                # 对于每个位置 t，logits[:, t-1, :] 表示在前缀 y_{<t} 条件下的预测
+                # 这是因为模型的第 t-1 个输出位置对应的是预测第 t 个 token
+                
+                # 计算 log 概率
+                log_p0 = F.log_softmax(ref_logits, dim=-1)
+                log_q = F.log_softmax(sft_logits, dim=-1)
+                
+                # 几何均值：log p* = 0.5 * (log p0 + log q)
+                log_p_star = 0.5 * (log_p0 + log_q)
+                
+                # 归一化得到概率分布
+                soft_labels = F.softmax(log_p_star, dim=-1)
+        
+        return soft_labels, loss_mask 
 
     # ========== 修改：保存检查点（保存两个模型）==========
     def save_checkpoint(self, step):
@@ -1352,17 +1763,23 @@ class FSDPSFTTrainer:
     # ========== 新增：Anti-forgetting 训练流程（方案 C）==========
     def fit_less_forgetting(self):
         """
-        方案 C: 交互正则化的 Anti-forgetting 训练流程
+        方案1实现: 逐位置展开训练
         
-        流程:
-        for outer_iter in range(n_outer_iterations):
-            Stage 1: 训练 q_sft（带正则化）
-                - 在原始 SFT 数据上训练
-                - 加入与 p_final 和 p0 的一致性正则化
-            
-            Stage 2: 训练 p_final（使用软标签）
-                - 软标签 = geometric_mean(p0, q_sft)
-                - 最小化 KL(p_final || soft_labels)
+        关键改动:
+        1. Stage 2 训练时，每个 (x, y) 展开为 seq_len-1 个训练样本
+        2. 每个展开的样本形如 (x + y[:t], soft_label_t)
+        3. 训练集大小从 |D| 扩展到 |D| × avg_seq_len
+        
+        伪代码对应:
+        for i in range(n_outer):
+            q = sft(p, D)
+            D_i = []
+            for (x, y) in D:
+                for t in range(1, len(y) + 1):
+                    prefix = x + y[:t-1]
+                    soft_label_t = geometric_mean(p0(prefix), q(prefix))
+                    D_i.append((prefix, soft_label_t))  # 每个位置一个样本
+            p = sft(p, D_i)  # |D_i| = |D| × seq_len
         """
         rank = self.device_mesh.get_rank()
         
@@ -1373,14 +1790,25 @@ class FSDPSFTTrainer:
                 default_backend=self.config.trainer.logger,
                 config=OmegaConf.to_container(self.config, resolve=True),
             )
+            print("\n" + "="*80)
+            print("Anti-Forgetting Training - Position-wise Expansion (方案1)")
+            print(f"Outer iterations: {self.n_outer_iterations}")
+            print(f"Soft label alpha: {self.soft_label_alpha}")
+            print("Training samples will be expanded by ~seq_len factor")
+            print("="*80 + "\n")
         
-        # 计算总训练步数
-        steps_per_outer = len(self.train_dataloader)  # Stage 1 每次迭代的步数
-        steps_per_epoch = len(self.train_dataloader)  # Stage 2 每个 epoch 的步数
+        # 注意：Stage 2 的训练步数会因位置展开而增加
+        # 实际步数 ≈ |D| × avg_seq_len / batch_size
+        steps_per_outer_stage1 = len(self.train_dataloader)
+        
+        # Stage 2 的步数取决于展开后的样本数，这里用估计值
+        avg_seq_len = getattr(self.config.data, "avg_seq_len", 512)
+        expansion_factor = avg_seq_len // 2  # 保守估计
+        steps_per_outer_stage2 = steps_per_outer_stage1 * expansion_factor
         
         total_training_steps = (
-            steps_per_outer * self.n_outer_iterations +  # Stage 1
-            steps_per_epoch * self.config.trainer.total_epochs * self.n_outer_iterations  # Stage 2
+            steps_per_outer_stage1 * self.n_outer_iterations +
+            steps_per_outer_stage2 * self.config.trainer.total_epochs * self.n_outer_iterations
         )
         
         if self.config.trainer.total_training_steps is not None:
@@ -1388,36 +1816,27 @@ class FSDPSFTTrainer:
         
         self.total_training_steps = total_training_steps
         
-        log_with_rank(
-            f"Total training steps: {self.total_training_steps}",
-            logger=logger,
-            rank=self.device_mesh.get_rank(),
-            log_only_rank_0=True,
-        )
+        if rank == 0:
+            print(f"Estimated total training steps: {self.total_training_steps}")
+            print(f"Stage 1 steps per outer: {steps_per_outer_stage1}")
+            print(f"Stage 2 steps per outer (estimated): {steps_per_outer_stage2}")
         
         global_step_sft = 0
         global_step_final = 0
         train_time = 0
         
-        # ==================== 主循环：交替训练 ====================
+        # 外层循环
         for outer_iter in range(self.n_outer_iterations):
             if rank == 0:
                 print("\n" + "=" * 80)
                 print(f"Outer Iteration {outer_iter + 1}/{self.n_outer_iterations}")
                 print("=" * 80)
             
-            # ========== Stage 1: 训练 SFT 模型 ==========
+            # ========== Stage 1: q = sft(p, D) ==========
             if rank == 0:
-                print(f"\n[Stage 1] Training SFT model with regularization...")
+                print(f"\n[Stage 1] Training q_{outer_iter+1} on original dataset D...")
             
             self.train_sampler.set_epoch(epoch=outer_iter)
-            
-            sft_metrics = {
-                "total_loss": 0,
-                "sft_loss": 0,
-                "consistency_loss": 0,
-                "reference_loss": 0
-            }
             
             for sft_step, data in enumerate(
                 tqdm(
@@ -1432,29 +1851,18 @@ class FSDPSFTTrainer:
                 global_step_sft += 1
                 train_time += metric["sft_model/train/time(s)"]
                 
-                # 累积指标
-                for key in sft_metrics:
-                    metric_key = f"sft_model/train/{key}"
-                    if metric_key in metric:
-                        sft_metrics[key] += metric[metric_key]
-                
-                # 定期记录
-                if rank == 0 and sft_step % 2 == 0:
+                if rank == 0 and global_step_sft % 50 == 0:
+                    metric["outer_iteration"] = outer_iter
+                    metric["stage"] = 1
                     tracking.log(data=metric, step=global_step_sft)
             
-            # 记录 Stage 1 平均指标
             if rank == 0:
-                avg_metrics = {
-                    f"sft_model/avg/{key}": val / len(self.train_dataloader)
-                    for key, val in sft_metrics.items()
-                }
-                avg_metrics["outer_iteration"] = outer_iter
-                tracking.log(data=avg_metrics, step=global_step_sft)
-                print(f"[Stage 1] Completed. Avg losses: {avg_metrics}")
+                print(f"[Stage 1] Completed. q_{outer_iter+1} ready.")
             
-            # ========== Stage 2: 训练最终模型（软标签）==========
+            # ========== Stage 2: 构造 D_i (展开到位置级别) ==========
             if rank == 0:
-                print(f"\n[Stage 2] Training final model with soft labels...")
+                print(f"\n[Stage 2] Training p_{outer_iter+1} with position-wise expanded dataset...")
+                print("Each (x, y) will be expanded to ~seq_len training samples")
             
             for epoch in range(self.config.trainer.total_epochs):
                 self.train_sampler.set_epoch(epoch=outer_iter * self.config.trainer.total_epochs + epoch)
@@ -1468,32 +1876,33 @@ class FSDPSFTTrainer:
                 ):
                     global_step_final += 1
                     
+                    # 训练：内部会自动展开位置
                     data = TensorDict(data, batch_size=self.config.data.train_batch_size).to(self.device_name)
                     metric = self.training_step_for_final_model(batch=data)
                     train_time += metric["final_model/train/time(s)"]
                     
-                    # 记录指标
+                    # if rank == 0 and global_step_final % 50 == 0:
                     if rank == 0:
                         metric["outer_iteration"] = outer_iter
                         metric["epoch"] = epoch
-                        if global_step_final % 50 == 0:
-                            tracking.log(data=metric, step=global_step_final)
+                        metric["stage"] = 2
+                        tracking.log(data=metric, step=global_step_final)
                     
                     # 保存检查点
                     is_save_step = global_step_final % self.config.trainer.save_freq == 0
                     if self.config.trainer.save_freq > 0 and is_save_step:
                         self.save_checkpoint(step=global_step_final)
                     
-                    # 早停检查
+                    # 早停
                     if global_step_final >= self.total_training_steps:
                         if rank == 0:
-                            print(f"Reached total training steps: {self.total_training_steps}")
+                            print(f"\nReached total training steps: {self.total_training_steps}")
                         return
             
             if rank == 0:
-                print(f"[Stage 2] Completed.")
+                print(f"[Stage 2] Completed. p_{outer_iter+1} trained on expanded dataset.")
             
-            # 评估（可选）
+            # 评估
             if self.config.trainer.get("eval_freq", -1) > 0:
                 if (outer_iter + 1) % self.config.trainer.eval_freq == 0:
                     self._evaluate_models(outer_iter, tracking, global_step_final)
@@ -1502,7 +1911,8 @@ class FSDPSFTTrainer:
         
         if rank == 0:
             print(f"\n{'='*80}")
-            print(f"Training completed! Total time: {train_time:.2f}s")
+            print(f"Training completed! Final model: p_{self.n_outer_iterations}")
+            print(f"Total time: {train_time:.2f}s")
             print(f"{'='*80}")
 
 
