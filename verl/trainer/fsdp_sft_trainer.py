@@ -575,43 +575,40 @@ class FSDPSFTTrainer:
         n_micro_batches = len(micro_batches)
         
         step_loss = 0
-        step_sft_loss = 0
-        step_consistency_loss = 0
-        step_reference_loss = 0
         
-        for micro_batch in micro_batches:
-            loss_mask = micro_batch.pop("loss_mask")
+        # for micro_batch in micro_batches:
+        #     loss_mask = micro_batch.pop("loss_mask")
 
-            # 1. 计算标准 SFT 损失
-            sft_loss = self._compute_loss_and_backward(
-                batch=micro_batch,
-                loss_mask=loss_mask,
-                n_micro_batches=n_micro_batches,
-                model=self.fsdp_model_sft,
-                do_backward=False
-            )
-            
-            # 2. 计算正则化损失
-            consistency_loss, reference_loss = self._compute_regularization_loss(
-                batch=micro_batch,
-                loss_mask=loss_mask,
-                n_micro_batches=n_micro_batches,
-                current_iteration=current_outer_iteration
-            )
-            
-            # 3. 组合损失（动态权重）
-            lambda1, lambda2 = self._get_dynamic_weights(current_outer_iteration)
-            
-            total_loss = sft_loss + lambda1 * consistency_loss + lambda2 * reference_loss
-            
-            # 4. 反向传播
-            total_loss.backward()
-            
-            # 记录各项损失
-            step_loss += total_loss.item()
-            step_sft_loss += sft_loss.item()
-            step_consistency_loss += consistency_loss.item()
-            step_reference_loss += reference_loss.item()
+        #     # 1. 计算标准 SFT 损失
+        #     sft_loss = self._compute_loss_and_backward(
+        #         batch=micro_batch,
+        #         loss_mask=loss_mask,
+        #         n_micro_batches=n_micro_batches,
+        #         model=self.fsdp_model_sft,
+        #         # do_backward=False
+        #     )
+           
+        #     # # 4. 反向传播
+        #     # sft_loss.backward()
+        #     # 记录各项损失
+        #     step_loss += sft_loss.item()
+
+        micro_batch = micro_batches[0]
+        loss_mask = micro_batch.pop("loss_mask")
+
+        # 1. 计算标准 SFT 损失
+        sft_loss = self._compute_loss_and_backward(
+            batch=micro_batch,
+            loss_mask=loss_mask,
+            n_micro_batches=n_micro_batches,
+            model=self.fsdp_model_sft,
+            # do_backward=False
+        )
+        
+        # # 4. 反向传播
+        # sft_loss.backward()
+        # 记录各项损失
+        step_loss += sft_loss.item()
         
         # 梯度裁剪
         if self.config.model.strategy == "fsdp":
@@ -640,35 +637,18 @@ class FSDPSFTTrainer:
         
         # 同步损失
         step_loss = torch.tensor(step_loss).to(self.device_name)
-        step_sft_loss = torch.tensor(step_sft_loss).to(self.device_name)
-        step_consistency_loss = torch.tensor(step_consistency_loss).to(self.device_name)
-        step_reference_loss = torch.tensor(step_reference_loss).to(self.device_name)
         
         end_time = time.time()
         spend_time_per_step = end_time - start_time
         
         if is_cuda_available:
             torch.distributed.all_reduce(step_loss, op=torch.distributed.ReduceOp.AVG)
-            torch.distributed.all_reduce(step_sft_loss, op=torch.distributed.ReduceOp.AVG)
-            torch.distributed.all_reduce(step_consistency_loss, op=torch.distributed.ReduceOp.AVG)
-            torch.distributed.all_reduce(step_reference_loss, op=torch.distributed.ReduceOp.AVG)
         elif is_npu_available:
             torch.distributed.all_reduce(step_loss)
-            torch.distributed.all_reduce(step_sft_loss)
-            torch.distributed.all_reduce(step_consistency_loss)
-            torch.distributed.all_reduce(step_reference_loss)
             step_loss /= self.device_mesh.size(0)
-            step_sft_loss /= self.device_mesh.size(0)
-            step_consistency_loss /= self.device_mesh.size(0)
-            step_reference_loss /= self.device_mesh.size(0)
         
         return {
-            "sft_model/train/total_loss": step_loss.detach().item(),
-            "sft_model/train/sft_loss": step_sft_loss.detach().item(),
-            "sft_model/train/consistency_loss": step_consistency_loss.detach().item(),
-            "sft_model/train/reference_loss": step_reference_loss.detach().item(),
-            "sft_model/train/lambda1": lambda1,
-            "sft_model/train/lambda2": lambda2,
+            "sft_model/train/sft_loss": step_loss.detach().item(),
             "sft_model/train/lr(1e-3)": lr * 1e3,
             "sft_model/train/time(s)": spend_time_per_step,
         }
@@ -842,7 +822,7 @@ class FSDPSFTTrainer:
         return loss
 
     # ========== 新增：构造软标签 ==========
-    def _construct_soft_labels(self, batch):
+    def _construct_soft_labels(self, batch, loss_mask):
         """
         使用 p0 (reference) 和 q_sft 的几何平均构造软标签
         p*(y|x) = exp(0.5 * (log p0(y|x) + log q_sft(y|x)))
@@ -858,8 +838,9 @@ class FSDPSFTTrainer:
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         position_ids = batch["position_ids"].to(device)
-        loss_mask = batch["loss_mask"][:, 1:].to(device)
+        loss_mask = loss_mask[:, 1:].to(device)
         
+        # batch_size = data.micro_batch_size_per_gpu
         batch_size, seq_len = input_ids.shape
         vocab_size = self.model_config.vocab_size
         
@@ -964,14 +945,15 @@ class FSDPSFTTrainer:
         step_loss = 0
         
         for micro_batch in micro_batches:
+            loss_mask = micro_batch.pop('loss_mask')
             # 构造软标签
-            soft_labels, loss_mask = self._construct_soft_labels(micro_batch)
+            soft_labels, loss_mask = self._construct_soft_labels(micro_batch, loss_mask)
             
             # 计算损失
             loss = self._compute_loss_with_soft_labels(
                 batch=micro_batch,
-                soft_labels=soft_labels,
                 loss_mask=loss_mask,
+                soft_labels=soft_labels,
                 n_micro_batches=n_micro_batches,
             )
             
@@ -1424,7 +1406,7 @@ class FSDPSFTTrainer:
                 print(f"Outer Iteration {outer_iter + 1}/{self.n_outer_iterations}")
                 print("=" * 80)
             
-            # ========== Stage 1: 训练 SFT 模型（带正则化）==========
+            # ========== Stage 1: 训练 SFT 模型 ==========
             if rank == 0:
                 print(f"\n[Stage 1] Training SFT model with regularization...")
             
@@ -1457,7 +1439,7 @@ class FSDPSFTTrainer:
                         sft_metrics[key] += metric[metric_key]
                 
                 # 定期记录
-                if rank == 0 and sft_step % 50 == 0:
+                if rank == 0 and sft_step % 2 == 0:
                     tracking.log(data=metric, step=global_step_sft)
             
             # 记录 Stage 1 平均指标
