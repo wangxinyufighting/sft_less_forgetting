@@ -954,7 +954,7 @@ class IterativeFSDPSFTTrainer(FSDPSFTTrainer):
         input_ids = batch["input_ids"].to(self.device_name)
         attention_mask = batch["attention_mask"].to(self.device_name)
         position_ids = batch["position_ids"].to(self.device_name)
-        loss_mask = batch.pop("loss_mask").reshape(-1).to(self.device_name)
+        loss_mask = batch.pop("loss_mask")[:, 1:].reshape(-1).to(self.device_name)
         
         loss_fct = nn.KLDivLoss(reduction="none")
         
@@ -995,39 +995,81 @@ class IterativeFSDPSFTTrainer(FSDPSFTTrainer):
         # Shift logits and labels
         # p predicts next token. logits[..., :-1, :] predicts input_ids[..., 1:]
         
-        # shift_logits_p = logits_p[..., :-1, :].contiguous()
-        # shift_logits_p0 = logits_p0[..., :-1, :].contiguous()
-        # shift_logits_q = logits_q[..., :-1, :].contiguous()
-        shift_logits_p = logits_p.contiguous()
-        shift_logits_p0 = logits_p0.contiguous()
-        shift_logits_q = logits_q.contiguous()
+        shift_logits_p = logits_p[..., :-1, :].contiguous()
+        shift_logits_p0 = logits_p0[..., :-1, :].contiguous()
+        shift_logits_q = logits_q[..., :-1, :].contiguous()
         
         # Compute log probabilities
         log_probs_p0 = torch.nn.functional.log_softmax(shift_logits_p0, dim=-1)
         log_probs_q = torch.nn.functional.log_softmax(shift_logits_q, dim=-1)
         
-        # Geometric mean in log space
-        # log p* ∝ 0.5 * (log p0 + log p1)
-        log_probs_star = 0.5 * (log_probs_p0 + log_probs_q)
-        probs_star = torch.exp(log_probs_star)
+        # Arithmetic mean in probability space (Mixture of Distributions)
+        # p* = (1 - w) * p0 + w * q
         
-        # Normalize p* (geometric mean is not automatically normalized)
-        # Z = sum(sqrt(p0 * p1))
-        # We need to normalize it so that sum(p*) = 1
-        probs_star = probs_star / probs_star.sum(dim=-1, keepdim=True)
+        probs_p0 = torch.exp(log_probs_p0)
+        probs_q = torch.exp(log_probs_q)
+
+        # Dynamic q_weight: Trust the model that predicts the ground truth better
+        # This automatically balances Learning (trust q) and Anti-Forgetting (trust p0)
+        if self.config.trainer.get("dynamic_q_weight", None):
+            shift_labels = input_ids[:, 1:].contiguous()
+            # Gather probability of the ground truth token: [Batch, Seq, 1]
+            p0_gt = torch.gather(probs_p0, -1, shift_labels.unsqueeze(-1))
+            q_gt = torch.gather(probs_q, -1, shift_labels.unsqueeze(-1))
+            
+            # Use q_weight from config as the prior trust in q (default 0.5)
+            # If we want to be conservative (anti-forgetting), set q_weight < 0.5 (e.g. 0.1)
+            # Formula: w = (prior_q * P_q) / (prior_q * P_q + prior_p0 * P_p0)
+            prior_q = self.config.trainer.get("q_weight", None)
+            prior_p0 = 1.0 - prior_q
+            
+            weighted_q = prior_q * q_gt
+            weighted_p0 = prior_p0 * p0_gt
+            
+            # If q is right and p0 is wrong -> w approaches 1 (Trust q)
+            # If q is wrong and p0 is right -> w approaches 0 (Trust p0)
+            # If both are right -> w approaches prior_q (Trust p0 if prior_q is low)
+            q_weight = weighted_q / (weighted_q + weighted_p0 + 1e-10)
+        else:
+            q_weight = self.config.trainer.get("q_weight", None)
         
-        # 4. Compute KL divergence loss: KL(p* || p) = sum p* * (log p* - log p)
-        # = - sum p* log p + constant (entropy of p*)
-        # We minimize - sum p* log p (Cross Entropy with soft labels)
+        probs_star = (1.0 - q_weight) * probs_p0 + q_weight * probs_q
+        
+        # 4. Compute KL divergence loss
         
         log_probs_p = torch.nn.functional.log_softmax(shift_logits_p, dim=-1)
+        probs_p = torch.exp(log_probs_p)
+
+        # Ensure log_probs_star is normalized and consistent with probs_star
+        log_probs_star = torch.log(probs_star + 1e-10)
         
-        # Cross Entropy: - sum(p_star * log_probs_p)
-        loss_per_token = -torch.sum(probs_star * log_probs_p, dim=-1)
-        # loss_per_token = loss_fct(log_probs_p, probs_star).mean(dim=-1)
+        # FKL: KL(p* || p) = sum p* * (log p* - log p)
+        # Input: log_probs_p (log-probabilities)
+        # Target: probs_star (probabilities)
+        fkl_loss = loss_fct(log_probs_p, probs_star).sum(dim=-1)
+
+        # RKL: KL(p || p*) = sum p * (log p - log p*)
+        # Input: log_probs_star (log-probabilities)
+        # Target: probs_p (probabilities)
+        rkl_loss = loss_fct(log_probs_star, probs_p).sum(dim=-1)
+
+        # Mix them
+        fkl_weight = self.config.trainer.get("fkl_weight", 0.5)
+        kl_loss = fkl_weight * fkl_loss + (1 - fkl_weight) * rkl_loss
+        
+        # Add Hard Cross Entropy Loss
+        hard_ce_weight = self.config.trainer.get("hard_ce_weight", 0.01)
+        if hard_ce_weight > 0:
+            shift_labels = input_ids[:, 1:].contiguous()
+            ce_loss = torch.nn.functional.cross_entropy(
+                shift_logits_p.view(-1, shift_logits_p.size(-1)), 
+                shift_labels.view(-1), 
+                reduction='none'
+            ).view(shift_labels.shape)
+            kl_loss = kl_loss + hard_ce_weight * ce_loss
         
         # Apply loss mask (This ensures we only train on y, ignoring x, matching the loop over y)
-        loss_per_token = loss_per_token.view(-1)
+        loss_per_token = kl_loss.view(-1)
         loss = loss_per_token * loss_mask
         
         # Normalize loss
@@ -1222,6 +1264,7 @@ def run_iterative_sft(config):
 
         # Configure for p training
         config_p = copy.deepcopy(config)
+        config_p.data.micro_batch_size_per_gpu = int(config.data.micro_batch_size_per_gpu / 2)
         
         # Same logic for p initialization
         if i == 0:
