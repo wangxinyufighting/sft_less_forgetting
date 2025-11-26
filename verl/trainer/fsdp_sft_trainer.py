@@ -861,11 +861,17 @@ class IterativeFSDPSFTTrainer(FSDPSFTTrainer):
                 
                 # If shard is missing, check for HF model
                 if not os.path.exists(shard_path):
+                    # Try to find huggingface directory inside the checkpoint path
                     hf_path = os.path.join(path, "huggingface")
                     if os.path.exists(hf_path):
                         if rank == 0:
                             print(f"FSDP shards not found at {shard_path}. Falling back to HF checkpoint at {hf_path}")
                         path = hf_path
+                        is_checkpoint = False
+                    # Also check if the path itself is a HF model directory (contains config.json)
+                    elif os.path.exists(os.path.join(path, "config.json")):
+                        if rank == 0:
+                            print(f"FSDP shards not found at {shard_path}. Treating {path} as HF model directory")
                         is_checkpoint = False
 
             # If it's a checkpoint, we init from base model then load weights
@@ -1003,6 +1009,9 @@ class IterativeFSDPSFTTrainer(FSDPSFTTrainer):
         log_probs_p0 = torch.nn.functional.log_softmax(shift_logits_p0, dim=-1)
         log_probs_q = torch.nn.functional.log_softmax(shift_logits_q, dim=-1)
         
+        base_q_weight = self.config.trainer.get("q_weight", None)
+        base_q_weight = float(base_q_weight)
+        
         # Arithmetic mean in probability space (Mixture of Distributions)
         # p* = (1 - w) * p0 + w * q
         
@@ -1011,7 +1020,7 @@ class IterativeFSDPSFTTrainer(FSDPSFTTrainer):
 
         # Dynamic q_weight: Trust the model that predicts the ground truth better
         # This automatically balances Learning (trust q) and Anti-Forgetting (trust p0)
-        if self.config.trainer.get("dynamic_q_weight", None):
+        if self.config.trainer.get("dynamic_q_weight", None) is True:
             shift_labels = input_ids[:, 1:].contiguous()
             # Gather probability of the ground truth token: [Batch, Seq, 1]
             p0_gt = torch.gather(probs_p0, -1, shift_labels.unsqueeze(-1))
@@ -1020,7 +1029,7 @@ class IterativeFSDPSFTTrainer(FSDPSFTTrainer):
             # Use q_weight from config as the prior trust in q (default 0.5)
             # If we want to be conservative (anti-forgetting), set q_weight < 0.5 (e.g. 0.1)
             # Formula: w = (prior_q * P_q) / (prior_q * P_q + prior_p0 * P_p0)
-            prior_q = self.config.trainer.get("q_weight", None)
+            prior_q = base_q_weight
             prior_p0 = 1.0 - prior_q
             
             weighted_q = prior_q * q_gt
@@ -1031,7 +1040,7 @@ class IterativeFSDPSFTTrainer(FSDPSFTTrainer):
             # If both are right -> w approaches prior_q (Trust p0 if prior_q is low)
             q_weight = weighted_q / (weighted_q + weighted_p0 + 1e-10)
         else:
-            q_weight = self.config.trainer.get("q_weight", None)
+            q_weight = base_q_weight
         
         probs_star = (1.0 - q_weight) * probs_p0 + q_weight * probs_q
         
@@ -1054,11 +1063,12 @@ class IterativeFSDPSFTTrainer(FSDPSFTTrainer):
         rkl_loss = loss_fct(log_probs_star, probs_p).sum(dim=-1)
 
         # Mix them
-        fkl_weight = self.config.trainer.get("fkl_weight", 0.5)
+        fkl_weight = self.config.trainer.get("fkl_weight", None)
         kl_loss = fkl_weight * fkl_loss + (1 - fkl_weight) * rkl_loss
         
         # Add Hard Cross Entropy Loss
-        hard_ce_weight = self.config.trainer.get("hard_ce_weight", 0.01)
+        hard_ce_weight = self.config.trainer.get("hard_ce_weight", None)
+        ce_loss = None
         if hard_ce_weight > 0:
             shift_labels = input_ids[:, 1:].contiguous()
             ce_loss = torch.nn.functional.cross_entropy(
@@ -1067,6 +1077,22 @@ class IterativeFSDPSFTTrainer(FSDPSFTTrainer):
                 reduction='none'
             ).view(shift_labels.shape)
             kl_loss = kl_loss + hard_ce_weight * ce_loss
+        
+        # Debug Logging
+        if self.device_mesh.get_rank() == 0:
+             with torch.no_grad():
+                 fkl_mean = fkl_loss.mean().item()
+                 rkl_mean = rkl_loss.mean().item()
+                 
+                 q_w_val = q_weight
+                 if isinstance(q_weight, torch.Tensor):
+                     q_w_val = q_weight.mean().item()
+                 
+                 ce_mean = 0.0
+                 if ce_loss is not None:
+                     ce_mean = ce_loss.mean().item()
+                 
+                 print(f"DEBUG: q_weight={q_w_val:.4f} | FKL={fkl_mean:.4f} | RKL={rkl_mean:.4f} | CE={ce_mean:.4f}")
         
         # Apply loss mask (This ensures we only train on y, ignoring x, matching the loop over y)
         loss_per_token = kl_loss.view(-1)
@@ -1178,11 +1204,23 @@ def run_iterative_sft(config):
     optim_config_p = config.optim.copy()
     if config.get("optim_p", None):
         optim_config_p = OmegaConf.merge(optim_config_p, config.optim_p)
+        
+    if rank == 0:
+        print('=================================')
+        print(f'optimiz_config_p: {optim_config_p}')
+        print(optim_config_p)
+        print('=================================')
 
     # optim_q uses optim_q if specified, else default optim config
     optim_config_q = config.optim.copy()
     if config.get("optim_q", None):
         optim_config_q = OmegaConf.merge(optim_config_q, config.optim_q)
+        
+    if rank == 0:
+        print('=================================')
+        print(f'optimiz_config_q: {optim_config_q}')
+        print(optim_config_q)
+        print('=================================')
 
     from verl.utils import hf_tokenizer
 
@@ -1195,72 +1233,79 @@ def run_iterative_sft(config):
         # ------------------------------------------------------
         q_save_path = os.path.join(work_dir, f"iter_{i}_q")
         
-        # Configure for q training
-        config_q = copy.deepcopy(config)
+        debug_q_path = config.trainer.get("debug_fixed_q_path", None)
         
-        # If p_path is a checkpoint (i > 0), we need to resume from it
-        # If p_path is base model (i == 0), we init from it
-        if i == 0:
-            config_q.model.partial_pretrain = p_path
-            config_q.trainer.resume_mode = "disable"
+        if debug_q_path:
+            if rank == 0:
+                print(f"DEBUG: Skipping q training. Using fixed q model from {debug_q_path}")
+            real_q_path = debug_q_path
         else:
-            # We treat each iteration as a fresh run initialized from the previous checkpoint
-            # This ensures we run for the specified epochs/steps starting from step 0
-            p_path_hf = os.path.join(p_path, "huggingface")
-            if os.path.exists(p_path_hf):
-                config_q.model.partial_pretrain = p_path_hf
-            else:
-                config_q.model.partial_pretrain = p_path
-            config_q.trainer.resume_mode = "disable"
+            # Configure for q training
+            config_q = copy.deepcopy(config)
             
-        config_q.trainer.default_local_dir = q_save_path
-        config_q.optim = optim_config_q
-        # Force 1 epoch for q training
-        config_q.trainer.total_epochs = 1
-        config_q.trainer.total_training_steps = None
-        
-        if rank == 0:
-            print(f"Training q_{i+1} from {p_path} with lr={config_q.optim.get('lr', 'unknown')} for 1 epoch...")
-            print(f"Saving checkpoints to {q_save_path} every {config_q.trainer.get('save_freq', 'unknown')} steps")
-        
-        # Instantiate Trainer for q
-        local_model_path_q = copy_to_local(src=config_q.model.partial_pretrain, verbose=True)
-        tokenizer_q = hf_tokenizer(local_model_path_q, trust_remote_code=config_q.model.trust_remote_code)
-        train_dataset_q = create_sft_dataset(
-            config_q.data.train_files, config_q.data, tokenizer_q, max_samples=config_q.data.get("train_max_samples", -1)
-        )
-        val_dataset_q = create_sft_dataset(
-            config_q.data.val_files, config_q.data, tokenizer_q, max_samples=config_q.data.get("val_max_samples", -1)
-        )
-        
-        trainer_q = FSDPSFTTrainer(
-            config=config_q,
-            device_mesh=device_mesh,
-            ulysses_device_mesh=ulysses_device_mesh,
-            tokenizer=tokenizer_q,
-            train_dataset=train_dataset_q,
-            val_dataset=val_dataset_q,
-        )
-        
-        trainer_q.fit()
-        
-        # Clean up q trainer
-        del trainer_q
-        del train_dataset_q
-        del val_dataset_q
-        del tokenizer_q
-        torch.cuda.empty_cache()
-        torch.distributed.barrier()
+            # If p_path is a checkpoint (i > 0), we need to resume from it
+            # If p_path is base model (i == 0), we init from it
+            if i == 0:
+                config_q.model.partial_pretrain = p_path
+                config_q.trainer.resume_mode = "disable"
+            else:
+                # We treat each iteration as a fresh run initialized from the previous checkpoint
+                # This ensures we run for the specified epochs/steps starting from step 0
+                p_path_hf = os.path.join(p_path, "huggingface")
+                if os.path.exists(p_path_hf):
+                    config_q.model.partial_pretrain = p_path_hf
+                else:
+                    config_q.model.partial_pretrain = p_path
+                config_q.trainer.resume_mode = "disable"
+                
+            config_q.trainer.default_local_dir = q_save_path
+            config_q.optim = optim_config_q
+            # Force 2 epochs for q training
+            config_q.trainer.total_epochs = 3
+            config_q.trainer.total_training_steps = None
+            
+            if rank == 0:
+                print(f"Training q_{i+1} from {p_path} with lr={config_q.optim.get('lr', 'unknown')} for 2 epochs...")
+                print(f"Saving checkpoints to {q_save_path} every {config_q.trainer.get('save_freq', 'unknown')} steps")
+            
+            # Instantiate Trainer for q
+            local_model_path_q = copy_to_local(src=config_q.model.partial_pretrain, verbose=True)
+            tokenizer_q = hf_tokenizer(local_model_path_q, trust_remote_code=config_q.model.trust_remote_code)
+            train_dataset_q = create_sft_dataset(
+                config_q.data.train_files, config_q.data, tokenizer_q, max_samples=config_q.data.get("train_max_samples", -1)
+            )
+            val_dataset_q = create_sft_dataset(
+                config_q.data.val_files, config_q.data, tokenizer_q, max_samples=config_q.data.get("val_max_samples", -1)
+            )
+            
+            trainer_q = FSDPSFTTrainer(
+                config=config_q,
+                device_mesh=device_mesh,
+                ulysses_device_mesh=ulysses_device_mesh,
+                tokenizer=tokenizer_q,
+                train_dataset=train_dataset_q,
+                val_dataset=val_dataset_q,
+            )
+            
+            trainer_q.fit()
+            
+            # Clean up q trainer
+            del trainer_q
+            del train_dataset_q
+            del val_dataset_q
+            del tokenizer_q
+            torch.cuda.empty_cache()
+            torch.distributed.barrier()
+
+            # Find the checkpoint we just trained for q
+            real_q_path = find_latest_ckpt_path(q_save_path)
+            if real_q_path is None:
+                 raise RuntimeError(f"Could not find checkpoint for q in {q_save_path}")
 
         # ------------------------------------------------------
         # 2. p = sft(p, D_i) with Soft Labels
         # ------------------------------------------------------
         p_save_path = os.path.join(work_dir, f"iter_{i}_p")
-        
-        # Find the checkpoint we just trained for q
-        real_q_path = find_latest_ckpt_path(q_save_path)
-        if real_q_path is None:
-             raise RuntimeError(f"Could not find checkpoint for q in {q_save_path}")
 
         # Configure for p training
         config_p = copy.deepcopy(config)
