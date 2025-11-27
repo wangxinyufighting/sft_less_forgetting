@@ -1261,7 +1261,8 @@ def run_iterative_sft(config):
             config_q.trainer.default_local_dir = q_save_path
             config_q.optim = optim_config_q
             # Force 2 epochs for q training
-            config_q.trainer.total_epochs = 3
+            # config_q.trainer.total_epochs = 1
+            config_q.trainer.total_epochs = 2
             config_q.trainer.total_training_steps = None
             
             if rank == 0:
